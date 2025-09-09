@@ -7,7 +7,9 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
+# Matplotlib & friends
 import matplotlib as mpl
+import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib import font_manager as fm
 
