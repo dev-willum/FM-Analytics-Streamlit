@@ -1,9 +1,4 @@
-# fmApp.py — FM Analytics
-# - Role Score = weighted composite of per-stat percentiles (0–100), not re-percentiled
-# - Plotly hoverlabel: white background, black text & border
-# - Scatter plots restricted to players in selected sidebar positions (BASELINE_DF)
-# - Unique position tokens, minimum minutes filter, pizzas, leaders, player finder, PCA, etc.
-
+# fmApp.py — FM Analytics (pos-aware role scores, Plotly, pretty cards)
 import os, io, re, json
 from io import BytesIO
 from uuid import uuid4
@@ -20,10 +15,71 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
+# Try to load mplsoccer for Matplotlib pizza
+_HAS_MPLSOCCER = True
+try:
+    from mplsoccer import PyPizza
+except Exception:
+    _HAS_MPLSOCCER = False
+
 # =========================
 # ======== CONFIG =========
 # =========================
 st.set_page_config(page_title="FM Analytics", layout="wide")
+
+# --- Minimal UI CSS (fonts + cards + plotly hover) ---
+st.markdown(
+    """
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Gabarito:wght@400;700&display=swap');
+      :root, body, .stApp { --app-font: 'Gabarito', 'DejaVu Sans', Arial, sans-serif; }
+      .stApp * { font-family: var(--app-font) !important; }
+
+      /* Card grid for Player Finder results */
+      .card-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+        gap: 12px;
+      }
+      .pcard {
+        background: #ffffff;
+        border: 1px solid rgba(0,0,0,.08);
+        border-radius: 12px;
+        padding: 12px 14px;
+        box-shadow: 0 2px 6px rgba(0,0,0,.06);
+      }
+      .pcard h4 {
+        margin: 0 0 4px 0;
+        font-size: 1.05rem;
+        line-height: 1.15;
+        color: #111;
+      }
+      .pcard .sub {
+        color: #333;
+        font-size: 0.92rem;
+        margin-bottom: 6px;
+      }
+      .pill {
+        display: inline-block;
+        background: #f1ffcd;
+        border: 1px solid #cfd9a7;
+        color: #222;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 0.78rem;
+        margin-right: 6px;
+        margin-top: 4px;
+      }
+      .kv { font-size: 0.85rem; color:#000; }
+      .kv b { color:#000; }
+
+      /* Streamlit tweaks */
+      .metric-ct { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_DIR = os.path.join(APP_DIR, "fonts")
 GABARITO_REG = os.path.join(FONT_DIR, "Gabarito-Regular.ttf")
@@ -45,14 +101,6 @@ font_normal = _fontprops_or_fallback(GABARITO_REG)
 font_bold   = _fontprops_or_fallback(GABARITO_BOLD)
 
 mpl.rcParams["font.family"] = ["Gabarito", "DejaVu Sans", "Arial", "sans-serif"]
-
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Gabarito:wght@400;700&display=swap');
-:root, body, .stApp { --app-font: 'Gabarito', 'DejaVu Sans', Arial, sans-serif; }
-.stApp * { font-family: var(--app-font) !important; }
-</style>
-""", unsafe_allow_html=True)
 
 POSTER_BG = "#f1ffcd"
 FONT_FAMILY = "Gabarito, DejaVu Sans, Arial, sans-serif"
@@ -98,6 +146,152 @@ def find_col(df: pd.DataFrame, names: List[str]) -> str | None:
             return cols[key]
     return None
 
+# ---------- Import Guide (smaller images) ----------
+GUIDE_IMG_WIDTH = 560  # px — tweak smaller/larger to taste
+
+def _guide_img(n: int):
+    """Show tutorial_n.png if present, at a fixed smaller width (no deprecation)."""
+    import os
+    p = os.path.join(APP_DIR, f"tutorial_{n}.png")
+    if os.path.isfile(p):
+        st.image(p, width=GUIDE_IMG_WIDTH)
+    else:
+        st.caption(f"*tutorial_{n}.png not found in working directory.*")
+
+def render_import_guide():
+    st.header("Import Guide")
+
+    # --- VERBATIM TEXT BLOCKS + IMAGES ---
+    st.markdown(r"""
+Download the Player Search.fmf view, and put this into Documents\Football Manager 2024\Views 
+
+Create the folder if it doesn't exist.
+
+In order to then narrow down the players, I have a filter called leagues filter, Download this if you just want some basic leagues to filter by. Put this in Documents\Football Manager 2024\Filters
+
+Create the folder if it doesn't exist.
+
+With the game open, navigate to scouting, and then to player search. From here, click overview, hover over custom, and click import.
+""")
+    _guide_img(1)
+
+    st.markdown(r"""
+With your view now set up, to use the league filters, click "New/Edit search", navigate to the bottom left corner, click the cog icon, and then click manage filters. When in here, click the import button, and select the filter.
+""")
+    _guide_img(2)
+    _guide_img(3)
+    _guide_img(4)
+
+    st.markdown(r"""
+With it loaded in, you will be brought back to the manage filters screen. Select your desired filter and then click the Ok button.
+
+  
+""")
+    _guide_img(5)
+
+    st.markdown(r"""
+The leagues may appear blank when you first load the filter in, don't worry! the filter will be working. If they appear blank, simply click out of the edit search menu by clicking Ok, and click back onto it. 
+
+It is important to note that if you want the most accurate dataset, you should untick the "interested" buttons  
+
+And you should also go back into edit search, click Exclude, and make sure that (your club)'s players are unticked 
+
+Now you have your dataset ready, to export the data you will need to click the top row of the players. Then with the top row selected press Control(command for mac) + A at the same time, wait for a second, if you can move your mouse on screen and nothing is highlighting or changing then it's just taking a second to process, don't click anything. 
+
+  
+""")
+    _guide_img(6)
+    _guide_img(7)
+    _guide_img(9)
+
+    st.markdown(r"""
+If things are highlighting after you've clicked Control + A, then just click the back arrow, and go back into the mode and try again.
+
+  
+""")
+    _guide_img(8)
+
+    st.markdown(r"""
+Hopefully you've been able to highlight every player. 
+
+Now click Control/Command + P, which should bring up this menu.
+
+""")
+    _guide_img(10)
+
+    st.markdown(r"""
+Select web page, and save it somewhere you can easily access! (I made a Transfers folder in my Football Manager 2024 Documents)
+
+
+With your file exported. Come back to the site and click upload. Find your .html file and click open.
+
+It will now read your file, in my experience it takes around 25 seconds to import around 4,000 players.  Times may vary.
+""")
+
+# ---- Money parsing (e.g., "£2.5M - £3.2M", "$800K", "€1.2B") -> numeric £m-ish ----
+_MONEY_RE = re.compile(r"([£$€])?\s*([0-9]*\.?[0-9]+)\s*([KkMmBb])?")
+def _scalar_from_token(n: float, tok: str | None) -> float:
+    if not tok: return n
+    t = tok.upper()
+    if t == "K": return n / 1_000_000.0
+    if t == "M": return n
+    if t == "B": return n * 1000.0
+    return n
+
+def money_to_millions(x: str | float | int) -> float | None:
+    """Return mid-value in £millions (symbol ignored; treat units consistently)."""
+    if x is None or (isinstance(x, float) and np.isnan(x)): return None
+    s = str(x).strip()
+    if not s: return None
+    # ranges like "£2.5M - £3.2M"
+    parts = re.split(r"\s*[-–]\s*", s)
+    vals = []
+    for p in parts:
+        m = _MONEY_RE.search(p)
+        if not m: continue
+        num = float(m.group(2))
+        unit = m.group(3)
+        vals.append(_scalar_from_token(num, unit))
+    if not vals:
+        # maybe plain number
+        try:
+            return float(s) / 1_000_000.0
+        except Exception:
+            return None
+    if len(vals) == 1:
+        return vals[0]
+    return float(np.mean(vals))
+
+def fig_to_png_bytes(fig, dpi: int = 300) -> bytes:
+    """Safely convert a Matplotlib figure to PNG bytes (for Streamlit downloads)."""
+    from io import BytesIO
+    buf = BytesIO()
+    try:
+        # draw canvas if backend needs it
+        if hasattr(fig, "canvas") and hasattr(fig.canvas, "draw"):
+            fig.canvas.draw()
+    except Exception:
+        pass
+    face = fig.get_facecolor() if hasattr(fig, "get_facecolor") else None
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", facecolor=face)
+    buf.seek(0)
+    return buf.getvalue()
+
+def money_min_max_millions(s: str) -> Tuple[float | None, float | None]:
+    parts = re.split(r"\s*[-–]\s*", str(s).strip())
+    nums = []
+    for p in parts:
+        m = _MONEY_RE.search(p)
+        if not m: continue
+        num = float(m.group(2)); unit = m.group(3)
+        nums.append(_scalar_from_token(num, unit))
+    if not nums:
+        v = money_to_millions(s)
+        return (v, v)
+    if len(nums) == 1:
+        return (nums[0], nums[0])
+    return (float(min(nums)), float(max(nums)))
+
 # percentile direction map
 LESS_IS_BETTER: Dict[str, bool] = {}
 def set_less_is_better(stat: str, flag: bool) -> None:
@@ -125,7 +319,6 @@ def compute_percentiles_for(player_row: pd.Series, stat_cols: List[str], base_df
     return rows
 
 def column_percentiles(v_series: pd.Series, base_series: pd.Series, less_better: bool) -> pd.Series:
-    """Return percentiles (0–100) of v_series vs base_series, mid-rank method."""
     ref = pd.to_numeric(base_series, errors="coerce").dropna().to_numpy()
     x = pd.to_numeric(v_series, errors="coerce").to_numpy()
     out = np.full_like(x, np.nan, dtype=float)
@@ -241,13 +434,17 @@ CREATE_PER90_FROM_TOTAL = {
     "Key Headers": "Key Headers/90",
 }
 
-# less-is-better defaults
 def set_defaults_less_is_better():
     set_less_is_better("Mistakes Leading to Goal", True)
     set_less_is_better("Conceded/90", True)
     set_less_is_better("Red Cards", True)
     set_less_is_better("Yellow Cards", True)
     set_less_is_better("Offsides", True)
+    # value columns (cheaper is "better" if used as percentile)
+    set_less_is_better("Transfer Value £m (min)", True)
+    set_less_is_better("Transfer Value £m (max)", True)
+    set_less_is_better("Transfer Value £m (mid)", True)
+    # defensive positives
     for s in ["Shots Blocked/90","Blocks/90","Interceptions/90","Clearances/90"]:
         set_less_is_better(s, False)
 set_defaults_less_is_better()
@@ -267,7 +464,7 @@ def apply_hard_remap(df_in: pd.DataFrame) -> pd.DataFrame:
         if df[c].dtype == object:
             df[c] = _maybe_numeric(df[c])
 
-    # per90 synthesis via minutes
+    # per90 via minutes
     min_name = find_col(df, ["Minutes","Mins","Min","Time Played"])
     denom = None
     if min_name:
@@ -290,6 +487,19 @@ def apply_hard_remap(df_in: pd.DataFrame) -> pd.DataFrame:
         xg = pd.to_numeric(df[xg_col], errors="coerce")
         sh = pd.to_numeric(df[shots_col], errors="coerce").replace(0, np.nan)
         df["xG/Shot"] = (xg / sh).round(2)
+
+    # Transfer Value parsing -> £m fields
+    tv_col = find_col(df, ["Transfer Value"])
+    if tv_col:
+        mins_ = []; maxs_ = []; mids_ = []
+        for v in df[tv_col].astype(str).tolist():
+            mn, mx = money_min_max_millions(v)
+            mins_.append(mn if mn is not None else np.nan)
+            maxs_.append(mx if mx is not None else np.nan)
+            mids_.append(np.mean([mn, mx]) if (mn is not None and mx is not None) else (mn if mn is not None else (mx if mx is not None else np.nan)))
+        df["Transfer Value £m (min)"] = np.array(mins_, dtype=float).round(3)
+        df["Transfer Value £m (max)"] = np.array(maxs_, dtype=float).round(3)
+        df["Transfer Value £m (mid)"] = np.array(mids_, dtype=float).round(3)
 
     # round floats
     float_cols = df.select_dtypes(include="float").columns
@@ -316,6 +526,34 @@ def expand_positions(pos_str: str | float) -> List[str]:
             tokens.append(p.upper())
     return sorted(set(tokens))
 
+# Archetype -> positional tokens baseline (pos-aware role scores)
+ARCH_BASELINE_TOKENS: Dict[str, List[str]] = {
+    # Goalkeepers
+    "GK — Shot Stopper": ["GK"],
+    "GK — Sweeper Keeper": ["GK"],
+    # Centre-backs
+    "CB — Stopper": ["D (C)"],
+    "CB — Ball Playing": ["D (C)"],
+    # Full-backs / Wing-backs
+    "FB — Overlapping": ["D (R)","D (L)","WB (R)","WB (L)"],
+    "FB — Inverted":    ["D (R)","D (L)","WB (R)","WB (L)"],
+    # Defensive Midfield
+    "DM — Ball Winner": ["DM"],
+    "DM — Deep-Lying Playmaker": ["DM"],
+    # Central Midfield
+    "CM — Box to Box": ["M (C)"],
+    "CM — Progresser": ["M (C)"],
+    # Attacking Midfield
+    "AM — Classic 10": ["AM (C)"],
+    "AM — Shadow Striker": ["AM (C)"],
+    # Wingers
+    "Winger — Classic":  ["AM (R)","AM (L)","M (R)","M (L)"],
+    "Winger — Inverted": ["AM (R)","AM (L)","M (R)","M (L)"],
+    # Strikers
+    "ST — Poacher": ["ST","ST (C)"],
+    "ST — Target Man": ["ST","ST (C)"],
+}
+
 # =========================
 # ======= PLOTTING ========
 # =========================
@@ -324,9 +562,118 @@ def get_contrast_text_color(hex_color):
     brightness = (r*299 + g*587 + b*114) * 255 / 1000
     return "#000000" if brightness > 140 else "#F2F2F2"
 
-def plotly_pizza(player_row: pd.Series, stat_cols: List[str], base_df: pd.DataFrame,
-                 weights: Dict[str, float] | None = None, apply_weights_to_slices: bool = False,
-                 sort_by_weight: bool = False) -> go.Figure:
+# --- Matplotlib pizza (optional) ---
+def mpl_pizza(player_row: pd.Series, stat_cols: List[str], title: str,
+              light: bool = True, base_df: pd.DataFrame | None = None):
+    if not _HAS_MPLSOCCER:
+        st.error("mplsoccer is not installed. Install with: pip install mplsoccer")
+        return None
+    if player_row is None or not stat_cols:
+        st.info("Pick a player and at least 1 stat."); return None
+
+    base = base_df if base_df is not None and not base_df.empty else _CURRENT_DF
+
+    pcts, raw_vals = [], []
+    for s in stat_cols:
+        if s not in base.columns:
+            pcts.append(0.0); raw_vals.append(np.nan); continue
+        series = pd.to_numeric(base[s], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        v = pd.to_numeric(player_row.get(s), errors="coerce")
+        raw_vals.append(None if pd.isna(v) else float(v))
+        if series.dropna().empty or pd.isna(v):
+            pcts.append(0.0); continue
+        if is_less_better(s): asc_series, asc_v = -series, -v
+        else:                 asc_series, asc_v =  series,  v
+        arr = asc_series.dropna().to_numpy(); arr.sort()
+        lo = np.searchsorted(arr, asc_v, side="left")
+        hi = np.searchsorted(arr, asc_v, side="right")
+        pct = ((lo + hi)/2) / arr.size * 100.0
+        pcts.append(float(np.clip(pct, 0.0, 100.0)))
+
+    slice_colors = ["#2E4374", "#1A78CF", "#D70232", "#FF9300", "#44C3A1",
+                    "#CA228D", "#E1C340", "#7575A9", "#9DDFD3"] * 6
+    slice_colors = slice_colors[:len(stat_cols)]
+    text_colors  = [get_contrast_text_color(c) for c in slice_colors]
+    params_disp  = [s for s in stat_cols]
+
+    bg = POSTER_BG if light else "#222222"
+    param_color = "#000000" if light else "#fffff0"
+    value_txt_color = "#000000" if light else "#fffff0"
+
+    baker = PyPizza(
+        params=params_disp,
+        background_color=bg,
+        straight_line_color="#000000",
+        straight_line_lw=.3,
+        last_circle_color="#000000",
+        last_circle_lw=1,
+        other_circle_lw=0,
+        inner_circle_size=0.30
+    )
+
+    def _fmt_val(x):
+        if x is None or pd.isna(x): return None
+        if float(x).is_integer(): return int(round(float(x)))
+        return round(float(x), 2)
+
+    fig, ax = baker.make_pizza(
+        pcts,
+        alt_text_values=[_fmt_val(v) for v in raw_vals],
+        figsize=(9.4, 9.8),
+        color_blank_space="same",
+        slice_colors=slice_colors,
+        value_colors=text_colors,
+        value_bck_colors=slice_colors,
+        blank_alpha=0.40,
+        kwargs_slices=dict(edgecolor="#000000", zorder=2, linewidth=1),
+        kwargs_params=dict(color=param_color, fontsize=12, fontproperties=font_normal, va="center"),
+        kwargs_values=dict(
+            color=value_txt_color,
+            fontsize=11,
+            fontproperties=font_normal,
+            zorder=3,
+            bbox=dict(edgecolor="#000000", facecolor="cornflowerblue",
+                      boxstyle=f"round,pad=0.16", lw=1)
+        ),
+    )
+    ax.set_position([0.06, 0.07, 0.88, 0.77])
+
+    name = player_row.get("Name", "Player")
+    club = player_row.get("Club", "")
+    pos  = player_row.get("Pos", "")
+    age  = player_row.get("Age", np.nan)
+    mins = player_row.get("Minutes", np.nan)
+    apps = player_row.get("Appearances", np.nan)
+
+    def _fmt_intish(x):
+        try:
+            f = float(x)
+            if np.isnan(f): return ""
+            return f"{int(round(f)):,}"
+        except Exception:
+            return str(x)
+
+    age_str  = "" if pd.isna(age) else f"{int(round(float(age)))}"
+    mins_str = _fmt_intish(mins)
+    apps_str = _fmt_intish(apps)
+
+    fig.text(0.5, 0.988, str(name), ha='center', va='top', fontsize=22,
+             color=param_color, fontproperties=font_bold)
+    sub1 = " • ".join([x for x in [str(pos) if pos else "", f"Age {age_str}" if age_str else "", str(club) if club else ""] if x])
+    if sub1:
+        fig.text(0.5, 0.954, sub1, ha='center', va='top', fontsize=14,
+                 color=param_color, fontproperties=font_normal)
+    sub2 = " • ".join([x for x in [f"Minutes {mins_str}" if mins_str else "", f"Apps {apps_str}" if apps_str else ""] if x])
+    if sub2:
+        fig.text(0.5, 0.93, sub2, ha='center', va='top', fontsize=12,
+                 color=param_color, fontproperties=font_normal)
+    if title:
+        fig.text(0.5, 0.91, f"{title}", ha='center', va='top', fontsize=12,
+                 color=param_color, fontproperties=font_normal)
+    return fig
+
+# --- Plotly pizza ---
+def plotly_pizza(player_row: pd.Series, stat_cols: List[str], base_df: pd.DataFrame) -> go.Figure:
     base = base_df if base_df is not None and not base_df.empty else _CURRENT_DF
     pts = compute_percentiles_for(player_row, stat_cols, base)
     stats = []; pcts = []; vals = []
@@ -335,25 +682,6 @@ def plotly_pizza(player_row: pd.Series, stat_cols: List[str], base_df: pd.DataFr
             stats.append(s); pcts.append(float(p)); vals.append(v)
     if not stats:
         return go.Figure()
-
-    if weights is None:
-        weights = {s: 1.0 for s in stats}
-    else:
-        weights = {s: float(weights.get(s, 1.0)) for s in stats}
-
-    order = list(range(len(stats)))
-    if sort_by_weight:
-        order = sorted(order, key=lambda i: weights[stats[i]], reverse=True)
-
-    stats = [stats[i] for i in order]
-    vals  = [vals[i]  for i in order]
-    w_arr = np.array([weights[s] for s in stats], dtype=float)
-    pcts  = [pcts[i] for i in order]
-
-    if apply_weights_to_slices and len(w_arr) > 0:
-        m = np.nanmax(w_arr) if np.isfinite(w_arr).any() else 1.0
-        scale = (w_arr / m)
-        pcts = (np.array(pcts, dtype=float) * scale).clip(0, 100).tolist()
 
     n = len(stats)
     thetas = np.linspace(0, 360, n, endpoint=False)
@@ -366,9 +694,9 @@ def plotly_pizza(player_row: pd.Series, stat_cols: List[str], base_df: pd.DataFr
         theta=thetas,
         width=[width]*n,
         marker=dict(color=slice_colors, line=dict(color="#000", width=1)),
-        customdata=np.array([stats, pcts, vals, w_arr], dtype=object).T,
-        hovertemplate="<b>%{customdata[0]}</b><br>Percentile (shown): %{customdata[1]:.1f}"
-                      "<br>Value: %{customdata[2]}<br>Weight: %{customdata[3]:.2f}<extra></extra>"
+        customdata=np.array([stats, pcts, vals], dtype=object).T,
+        hovertemplate="<b>%{customdata[0]}</b><br>Percentile: %{customdata[1]:.1f}"
+                      "<br>Value: %{customdata[2]}<extra></extra>"
     ))
     fig.update_layout(
         template="simple_white",
@@ -494,7 +822,7 @@ ARCHETYPES: Dict[str, List[str]] = {
     ],
 }
 
-# ---- Default weights per archetype (examples filled) ----
+# ---- Default weights per archetype ----
 DEFAULT_ARCHETYPE_WEIGHTS: Dict[str, Dict[str, float]] = {
     "GK — Shot Stopper": {
         "Save %": 1.90, "Expected Save %": 1.60, "Expected Goals Prevented/90": 1.80,
@@ -577,6 +905,44 @@ DEFAULT_ARCHETYPE_WEIGHTS: Dict[str, Dict[str, float]] = {
     },
 }
 
+# --- helper: resolve possible keys for a given archetype name
+def _resolve_weight_key(arch_name: str) -> list[str]:
+    """Try both '(Custom) Name' and 'Name' so older/saved keys still work."""
+    keys = [arch_name]
+    if arch_name.startswith("(Custom) "):
+        keys.append(arch_name.replace("(Custom) ", "", 1))
+    else:
+        keys.append(f"(Custom) {arch_name}")
+    return keys
+
+def get_arch_weights(arch_name: str, stats: list[str]) -> dict[str, float]:
+    """
+    Returns per-stat weights for this archetype:
+    1. Start from 1.0 for every stat
+    2. Overlay built-in defaults (if any)
+    3. Overlay saved user weights (supports both '(Custom) Name' and 'Name' keys)
+    """
+    # built-in defaults (empty for customs)
+    base_default = DEFAULT_ARCHETYPE_WEIGHTS.get(arch_name, {})
+
+    # user-saved weights (look under flexible keys)
+    saved = {}
+    for k in _resolve_weight_key(arch_name):
+        if k in st.session_state["arch_weights"]:
+            saved = st.session_state["arch_weights"][k]
+            break
+
+    # merge precedence: 1.0 -> built-in default -> saved
+    w = {s: 1.0 for s in stats}
+    for s in stats:
+        if s in base_default:
+            w[s] = float(base_default[s])
+    for s in stats:
+        if s in saved:
+            w[s] = float(saved[s])
+    return w
+
+
 # =========================
 # ======= APP STATE =======
 # =========================
@@ -636,9 +1002,13 @@ df = pd.DataFrame(); cache_id = ""
 if uploaded is not None:
     df, cache_id = parse_and_cache(uploaded.name, uploaded.read())
 
-if df.empty:
-    st.info("Upload an FM export to begin.")
+# If nothing uploaded yet, show Import Guide as its own sidebar mode/page
+if uploaded is None:
+    st.sidebar.header("Mode")
+    st.sidebar.radio("Mode", ["Import Guide"], index=0)
+    render_import_guide()
     st.stop()
+
 
 # ======== Sidebar: Minimum Minutes ========
 if "Minutes" in df.columns:
@@ -701,11 +1071,13 @@ display_cols = [c for c in df_work.columns if c not in {name_col, "Club", "Leagu
 def all_archetypes_dict() -> Dict[str, List[str]]:
     arch_all = dict(ARCHETYPES)
     arch_all.update({f"(Custom) {k}": v.get("stats", []) for k, v in st.session_state["custom_arches"].items()})
-    for k in list(arch_all.keys()):
-        arch_all[k] = [s for s in arch_all[k] if s in df_work.columns and pd.api.types.is_numeric_dtype(df_work[s])]
-        if not arch_all[k]:
-            del arch_all[k]
-    return arch_all
+    # only keep stats present & numeric
+    keep = {}
+    for k, lst in arch_all.items():
+        numeric_stats = [s for s in lst if s in df_work.columns and pd.api.types.is_numeric_dtype(df_work[s])]
+        if numeric_stats:
+            keep[k] = numeric_stats
+    return keep
 
 def default_weights_for(arch_name: str, stats: List[str]) -> Dict[str, float]:
     base = DEFAULT_ARCHETYPE_WEIGHTS.get(arch_name, {})
@@ -713,27 +1085,30 @@ def default_weights_for(arch_name: str, stats: List[str]) -> Dict[str, float]:
 
 def get_arch_weights(arch_name: str, stats: List[str]) -> Dict[str, float]:
     saved = st.session_state["arch_weights"].get(arch_name, {})
-    if not saved:
-        saved = {}
     w = default_weights_for(arch_name, stats)
     w.update({s: float(saved.get(s, w.get(s, 1.0))) for s in stats})
-    w = {s: float(w.get(s, 1.0)) for s in stats}
-    return w
+    return {s: float(w.get(s, 1.0)) for s in stats}
 
-def set_arch_weights(arch_name: str, new_weights: Dict[str, float]) -> None:
-    st.session_state["arch_weights"][arch_name] = {k: float(v) for k, v in new_weights.items()}
+def role_baseline_df(arch_name: str) -> pd.DataFrame:
+    """Return position-restricted baseline for a given archetype; fallback to user baseline."""
+    toks = ARCH_BASELINE_TOKENS.get(arch_name, None)
+    if toks:
+        df_role = filter_by_tokens(df_work, toks)
+        if not df_role.empty:
+            return df_role
+    return BASELINE_DF
 
-def role_scores_for_archetype(arch_name: str, base_df: pd.DataFrame) -> pd.Series:
+def role_scores_for_archetype(arch_name: str) -> pd.Series:
     """
-    Role Score (0–100) = weighted composite of per-stat percentiles (0–100).
-    Steps:
-      1) For each stat in the archetype, compute percentile vs baseline (respect less-is-better).
-      2) Take a weighted average per player (weights renormalised for missing stats).
+    Role Score (0–100) = weighted composite of per-stat percentiles (0–100),
+    computed vs archetype-specific positional baseline.
     """
     arch_all = all_archetypes_dict()
     stats = arch_all.get(arch_name, [])
     if not stats:
         return pd.Series([np.nan]*len(df_work), index=df_work.index)
+
+    base_df_role = role_baseline_df(arch_name)
 
     weights = get_arch_weights(arch_name, stats)
     w = np.array([float(weights.get(s, 1.0)) for s in stats], dtype=float)
@@ -741,9 +1116,9 @@ def role_scores_for_archetype(arch_name: str, base_df: pd.DataFrame) -> pd.Serie
 
     pct_mat = []
     for s in stats:
-        pct_s = column_percentiles(df_work[s], base_df[s], is_less_better(s))
+        pct_s = column_percentiles(df_work[s], base_df_role[s], is_less_better(s))
         pct_mat.append(pct_s.to_numpy())
-    P = np.vstack(pct_mat).T  # [n_players, n_stats], NaNs allowed
+    P = np.vstack(pct_mat).T  # [n_players, n_stats]
 
     valid = np.isfinite(P).astype(float)
     w_row = valid * w
@@ -758,19 +1133,34 @@ def role_scores_for_archetype(arch_name: str, base_df: pd.DataFrame) -> pd.Serie
 def unique_key(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:8]}"
 
-# ---- Pizza ----
+# ---- Pizza (Plotly ↔ Matplotlib) ----
 if mode == "Pizza":
     st.subheader("Custom Pizza")
+    renderer = st.selectbox("Renderer", ["Plotly", "Matplotlib"], index=0,
+                            help="Choose Plotly for interactivity or Matplotlib (mplsoccer) for publication-style.")
     default_stats = [x for x in ["Shots/90","SoT/90","Expected Goals","Expected Assists/90","Dribbles/90","Open Play Key Passes/90"] if x in numeric_cols]
     stats_pick = st.multiselect("Choose stats (ordered)", options=numeric_cols, default=default_stats)
-    fig = plotly_pizza(player_row, stats_pick, BASELINE_DF)
-    fig.update_layout(title=f"{player} — Custom Pizza")
-    _plotly_polar_black(fig)
-    st.plotly_chart(fig, use_container_width=True, theme=None)
 
-# ---- Archetypes ----
+    if renderer == "Plotly":
+        fig = plotly_pizza(player_row, stats_pick, BASELINE_DF)
+        fig.update_layout(title=f"{player} — Custom Pizza")
+        _plotly_polar_black(fig)
+        st.plotly_chart(fig, use_container_width=True, theme=None)
+    else:
+        style = st.selectbox("Matplotlib Style", ["Light", "Dark"], index=0)
+        if not _HAS_MPLSOCCER:
+            st.error("mplsoccer is not installed. Install with: pip install mplsoccer")
+        else:
+            fig = mpl_pizza(player_row, stats_pick, title="Custom Pizza", light=(style=="Light"), base_df=BASELINE_DF)
+            if fig is not None:
+                st.pyplot(fig, clear_figure=False)
+                st.download_button("Download pizza (PNG)", data=fig_to_png_bytes(fig),
+                                   file_name=f"pizza_{str(player).replace(' ','_')}.png",
+                                   mime="image/png", key=unique_key("dl_pizza"))
+
+# ---- Archetypes (permanent weights pane, no dropdowns/expanders) ----
 elif mode == "Archetypes":
-    st.subheader("Archetype Pizza (with per-stat weights)")
+    st.subheader("Archetype Pizza (per-stat weights; role scores are pos-aware)")
     arch_all = all_archetypes_dict()
     if not arch_all:
         st.warning("No archetypes with valid stats available.")
@@ -780,53 +1170,47 @@ elif mode == "Archetypes":
         if len(arch_stats) < 1:
             st.warning("No valid stats for this archetype in the current dataset.")
         else:
-            with st.expander("Weights (per stat for this archetype)", expanded=True):
-                w = get_arch_weights(arch_name, arch_stats)
-                cols = st.columns(min(4, len(arch_stats)))
-                new_w = {}
-                for i, s in enumerate(arch_stats):
-                    with cols[i % len(cols)]:
-                        new_w[s] = st.number_input(f"{s}", min_value=0.0, value=float(w.get(s, 1.0)), step=0.1, key=f"w_{arch_name}_{s}")
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    if st.button("Save weights", key=f"savew_{arch_name}"):
-                        set_arch_weights(arch_name, new_w); st.success("Saved weights.")
-                with c2:
-                    if st.button("Equal weights", key=f"eqw_{arch_name}"):
-                        set_arch_weights(arch_name, {s:1.0 for s in arch_stats}); st.success("Set equal weights.")
-                with c3:
-                    if st.button("Reset to defaults", key=f"defaultw_{arch_name}"):
-                        set_arch_weights(arch_name, default_weights_for(arch_name, arch_stats)); st.success("Reset to defaults.")
-                with c4:
-                    if st.button("Export weights (JSON)", key=f"expw_{arch_name}"):
-                        payload = {"archetype": arch_name, "weights": get_arch_weights(arch_name, arch_stats)}
-                        st.download_button("Download", data=json.dumps(payload, indent=2).encode("utf-8"),
-                                           file_name=f"weights_{re.sub(r'\\W+','_',arch_name)}.json",
-                                           mime="application/json", key=unique_key("dl_w_json"))
-            with st.expander("Import weights JSON", expanded=False):
-                up = st.file_uploader("Upload JSON", type=["json"], key=f"impw_{arch_name}")
-                if up is not None:
-                    try:
-                        data = json.loads(up.read().decode("utf-8"))
-                        if isinstance(data, dict) and "weights" in data:
-                            w_in = {k: float(v) for k, v in data["weights"].items()}
-                            w_in = {s: w_in.get(s, 1.0) for s in arch_stats}
-                            set_arch_weights(arch_name, w_in); st.success("Imported weights.")
-                        else:
-                            st.error("JSON missing 'weights' field.")
-                    except Exception as e:
-                        st.error(f"Import failed: {e}")
+            st.markdown("**Weights (per stat for this archetype)**")
+            w = get_arch_weights(arch_name, arch_stats)
+            cols = st.columns(min(4, len(arch_stats)))
+            new_w = {}
+            for i, s in enumerate(arch_stats):
+                with cols[i % len(cols)]:
+                    new_w[s] = st.number_input(f"{s}", min_value=0.0, value=float(w.get(s, 1.0)), step=0.1, key=f"w_{arch_name}_{s}")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if st.button("Save weights", key=f"savew_{arch_name}"):
+                    st.session_state["arch_weights"][arch_name] = {k: float(v) for k, v in new_w.items()}
+                    st.success("Saved weights.")
+            with c2:
+                if st.button("Equal weights", key=f"eqw_{arch_name}"):
+                    st.session_state["arch_weights"][arch_name] = {s:1.0 for s in arch_stats}
+                    st.success("Set equal weights.")
+            with c3:
+                if st.button("Reset to defaults", key=f"defaultw_{arch_name}"):
+                    st.session_state["arch_weights"][arch_name] = default_weights_for(arch_name, arch_stats)
+                    st.success("Reset to defaults.")
 
-            apply_weights = st.checkbox("Apply weights to pizza slices (visual scaling)", value=False)
-            sort_by_w    = st.checkbox("Sort slices by weight (desc)", value=False)
-
-            fig = plotly_pizza(player_row, arch_stats, BASELINE_DF,
-                               weights=get_arch_weights(arch_name, arch_stats),
-                               apply_weights_to_slices=apply_weights,
-                               sort_by_weight=sort_by_w)
-            fig.update_layout(title=f"{player} — {arch_name}")
-            _plotly_polar_black(fig)
-            st.plotly_chart(fig, use_container_width=True, theme=None)
+            renderer_arch = st.selectbox("Renderer", ["Plotly", "Matplotlib"], index=0, key="arch_renderer")
+            if renderer_arch == "Plotly":
+                # pizza vs archetype's position baseline
+                role_base = role_baseline_df(arch_name)
+                fig = plotly_pizza(player_row, arch_stats, role_base)
+                fig.update_layout(title=f"{player} — {arch_name} (pos baseline)")
+                _plotly_polar_black(fig)
+                st.plotly_chart(fig, use_container_width=True, theme=None)
+            else:
+                style = st.selectbox("Matplotlib Style", ["Light", "Dark"], index=0, key="arch_style2")
+                if not _HAS_MPLSOCCER:
+                    st.error("mplsoccer is not installed. Install with: pip install mplsoccer")
+                else:
+                    fig = mpl_pizza(player_row, arch_stats, title=f"{arch_name} (pos baseline)", light=(style=="Light"),
+                                    base_df=role_baseline_df(arch_name))
+                    if fig is not None:
+                        st.pyplot(fig, clear_figure=False)
+                        st.download_button("Download pizza (PNG)", data=fig_to_png_bytes(fig),
+                                           file_name=f"pizza_{str(player).replace(' ','_')}_{re.sub(r'\\W+','_',arch_name)}.png",
+                                           mime="image/png", key=unique_key("dl_archpizza"))
 
 # ---- Percentile Bars ----
 elif mode == "Percentile Bars":
@@ -947,8 +1331,9 @@ elif mode == "Stat Scatter":
     st.plotly_chart(fig, use_container_width=True, theme=None)
 
 # ---------- Role Scatter ----------
+# ---------- Role Scatter ----------
 elif mode == "Role Scatter":
-    st.subheader("Role Scatter (weighted composite of percentiles, 0–100)")
+    st.subheader("Role Scatter (pos-aware; weighted composite of percentiles, 0–100)")
     arch_all = all_archetypes_dict()
     if not arch_all:
         st.warning("No archetypes with valid stats available.")
@@ -965,38 +1350,44 @@ elif mode == "Role Scatter":
                                options=["(none)"] + sorted(BASELINE_DF[name_col].astype(str).unique().tolist()),
                                index=0, key="role_hi")
 
-        # Compute scores across full df_work, then restrict to BASELINE_DF players
-        score_x = role_scores_for_archetype(ax, BASELINE_DF).reindex(BASELINE_DF.index)
-        score_y = role_scores_for_archetype(ay, BASELINE_DF).reindex(BASELINE_DF.index)
+        # --- Compute scores for ALL players (df_work), then display only players in BASELINE_DF (sidebar filter)
+        score_x_all = role_scores_for_archetype(ax)  # index = df_work.index
+        score_y_all = role_scores_for_archetype(ay)
 
-        df_rs = BASELINE_DF[[name_col]].copy()
-        if "Club" in BASELINE_DF.columns: df_rs["Club"] = BASELINE_DF["Club"]
-        if pos_col in BASELINE_DF.columns: df_rs["Pos"] = BASELINE_DF[pos_col]
-        df_rs[ax] = score_x; df_rs[ay] = score_y
-        df_rs = df_rs[df_rs[ax].notna() & df_rs[ay].notna()]
+        # Display frame is strictly the sidebar-filtered cohort:
+        df_disp = BASELINE_DF[[name_col]].copy()
+        if "Club" in BASELINE_DF.columns: df_disp["Club"] = BASELINE_DF["Club"]
+        if pos_col in BASELINE_DF.columns: df_disp["Pos"] = BASELINE_DF[pos_col]
+
+        # Reindex role scores to the displayed cohort (do NOT filter by archetype tokens!)
+        df_disp[ax] = score_x_all.reindex(df_disp.index)
+        df_disp[ay] = score_y_all.reindex(df_disp.index)
+        df_disp = df_disp[df_disp[ax].notna() & df_disp[ay].notna()]
 
         fig = go.Figure()
 
         if show_cloud:
-            sc = px.scatter(df_rs, x=ax, y=ay, opacity=0.35, hover_name=name_col,
+            sc = px.scatter(df_disp, x=ax, y=ay, opacity=0.35, hover_name=name_col,
                             hover_data={name_col:False,"Club":True,"Pos":True,ax:":.1f",ay:":.1f"})
             for tr in sc.data: fig.add_trace(tr)
 
         if age_ok:
             ages = pd.to_numeric(BASELINE_DF["Age"], errors="coerce")
             if u23:
-                cohort = df_rs[df_rs[name_col].isin(BASELINE_DF.loc[ages < 23, name_col])]
+                cohort_ix = BASELINE_DF.index[ages < 23]
+                cohort = df_disp.loc[df_disp.index.intersection(cohort_ix)]
                 fig.add_trace(go.Scatter(x=cohort[ax], y=cohort[ay], mode="markers",
                                          marker=dict(size=10, color="rgba(26,120,207,0.85)", line=dict(width=1, color="black")),
                                          name="U23", hovertext=cohort[name_col], hoverinfo="text"))
             if u21:
-                cohort = df_rs[df_rs[name_col].isin(BASELINE_DF.loc[ages < 21, name_col])]
+                cohort_ix = BASELINE_DF.index[ages < 21]
+                cohort = df_disp.loc[df_disp.index.intersection(cohort_ix)]
                 fig.add_trace(go.Scatter(x=cohort[ax], y=cohort[ay], mode="markers",
                                          marker=dict(size=10, color="rgba(199, 43, 98, 0.85)", line=dict(width=1, color="black")),
                                          name="U21", hovertext=cohort[name_col], hoverinfo="text"))
 
         if hi_name != "(none)":
-            prow = df_rs[df_rs[name_col] == hi_name]
+            prow = df_disp[df_disp[name_col] == hi_name]
             if not prow.empty:
                 fig.add_trace(go.Scatter(
                     x=prow[ax], y=prow[ay], mode="markers+text",
@@ -1014,19 +1405,25 @@ elif mode == "Role Scatter":
         _plotly_axes_black(fig)
         st.plotly_chart(fig, use_container_width=True, theme=None)
 
+
+# ---------- Top 10 — Roles ----------
 # ---------- Top 10 — Roles ----------
 elif mode == "Top 10 — Roles":
-    st.subheader("Top 10 by Role Score (weighted composite, 0–100)")
+    st.subheader("Top 10 by Role Score (pos-aware, weighted composite, 0–100)")
     arch_all = all_archetypes_dict()
     if not arch_all:
         st.info("No archetypes with valid stats available.")
     else:
         role = st.selectbox("Role", list(arch_all.keys()))
-        scores = role_scores_for_archetype(role, BASELINE_DF).round(1)
-        tbl = df_work[[name_col]].copy()
-        if "Club" in df_work.columns: tbl["Club"] = df_work["Club"]
-        if pos_col in df_work.columns: tbl["Pos"] = df_work[pos_col]
+        # Compute scores for everyone, then slice to the sidebar selection only:
+        scores_all = role_scores_for_archetype(role).round(1)
+        scores = scores_all.reindex(BASELINE_DF.index)
+
+        tbl = BASELINE_DF[[name_col]].copy()
+        if "Club" in BASELINE_DF.columns: tbl["Club"] = BASELINE_DF["Club"]
+        if pos_col in BASELINE_DF.columns: tbl["Pos"] = BASELINE_DF[pos_col]
         tbl["Score"] = scores
+
         top = tbl.dropna(subset=["Score"]).sort_values("Score", ascending=False).head(10)
 
         fig = go.Figure(go.Bar(
@@ -1035,7 +1432,7 @@ elif mode == "Top 10 — Roles":
             customdata=np.stack([top.get("Club", pd.Series([""]*len(top)))], axis=1)
         ))
         fig.update_layout(
-            title=f"Top 10 — {role}",
+            title=f"Top 10 — {role} (computed vs role baseline, shown for sidebar selection)",
             xaxis=dict(title="Role Score (0–100)", range=[0, 100]),
             yaxis=dict(autorange="reversed"),
             template="simple_white",
@@ -1045,52 +1442,13 @@ elif mode == "Top 10 — Roles":
         _plotly_axes_black(fig)
         st.plotly_chart(fig, use_container_width=True, theme=None)
 
-# ---------- Top 10 — Stats ----------
-elif mode == "Top 10 — Stats":
-    st.subheader("Top 10 by Stat")
-    stat = st.selectbox("Stat", options=numeric_cols)
-    rank_type = st.radio("Rank by", ["Percentile (vs baseline)", "Raw Value"], horizontal=True)
 
-    tbl = df_work[[name_col]].copy()
-    if "Club" in df_work.columns: tbl["Club"] = df_work["Club"]
-    if pos_col in df_work.columns: tbl["Pos"] = df_work[pos_col]
-
-    if rank_type.startswith("Percentile"):
-        series = column_percentiles(df_work[stat], BASELINE_DF[stat], is_less_better(stat)).round(1)
-        tbl["Value"] = series
-        top = tbl.dropna(subset=["Value"]).sort_values("Value", ascending=False).head(10)
-        x_title = "Percentile (0–100)"; x_range = [0, 100]
-        hover = "<b>%{y}</b><br>Percentile: %{x:.1f}<br>Club: %{customdata[0]}<extra></extra>"
-    else:
-        series = pd.to_numeric(df_work[stat], errors="coerce")
-        tbl["Value"] = series
-        asc = is_less_better(stat)
-        top = tbl.dropna(subset=["Value"]).sort_values("Value", ascending=asc).head(10)
-        x_title = f"{stat} ({'lower is better' if asc else 'higher is better'})"
-        x_range = None
-        hover = "<b>%{y}</b><br>Value: %{x}<br>Club: %{customdata[0]}<extra></extra>"
-
-    fig = go.Figure(go.Bar(
-        x=top["Value"], y=top[name_col], orientation="h",
-        hovertemplate=hover,
-        customdata=np.stack([top.get("Club", pd.Series([""]*len(top)))], axis=1)
-    ))
-    fig.update_layout(
-        title=f"Top 10 — {stat}",
-        xaxis=dict(title=x_title, range=x_range),
-        yaxis=dict(autorange="reversed"),
-        template="simple_white",
-        paper_bgcolor=POSTER_BG, plot_bgcolor=POSTER_BG,
-        font=dict(family=FONT_FAMILY)
-    )
-    _plotly_axes_black(fig)
-    st.plotly_chart(fig, use_container_width=True, theme=None)
-
-# ---------- Player Finder ----------
+# ---------- Player Finder (values/percentiles; fancy cards; supports Transfer Value £m) ----------
 elif mode == "Player Finder":
     st.subheader("Player Finder (values or percentiles)")
+    st.caption("Tip: Transfer Value fields are in **£ millions**: ‘Transfer Value £m (min/max/mid)’.")
+
     mode_type = st.radio("Use", ["Values", "Percentiles"], horizontal=True)
-    st.caption("Percentiles are computed vs your selected baseline positions above.")
 
     max_rows = 6
     ncrit = st.slider("Number of criteria", 1, max_rows, 3)
@@ -1123,21 +1481,50 @@ elif mode == "Player Finder":
             mask_all &= mask
 
         res = out.loc[mask_all].copy()
-        keep_cols = [name_col]
-        for c in ["Club", pos_col, "Minutes", "Avg Rating"]:
-            if c in res.columns and c not in keep_cols:
-                keep_cols.append(c)
-        for (stat, _, _) in crits:
-            if stat not in keep_cols: keep_cols.append(stat)
-            pct_name = f"{stat} (pct)"
-            if pct_name in res.columns and pct_name not in keep_cols: keep_cols.append(pct_name)
 
-        res = res[keep_cols].sort_values(by=[keep_cols[0]])
-        st.success(f"Found {len(res):,} players matching.")
-        st.dataframe(res, use_container_width=True)
+        # Build “cards” HTML
+        cards = []
+        for _, r in res.iterrows():
+            nm   = str(r.get(name_col, ""))
+            club = str(r.get("Club", "")) if "Club" in res.columns else ""
+            pos  = str(r.get(pos_col, "")) if pos_col in res.columns else ""
+            age  = r.get("Age", "")
+            mins = r.get("Minutes", "")
+            rat  = r.get("Avg Rating", "")
+            tvm  = r.get("Transfer Value £m (mid)", np.nan)
+            tvtxt = f"£{tvm:.2f}m" if pd.notna(tvm) else (str(r.get("Transfer Value", "")) if "Transfer Value" in res.columns else "—")
 
-        csv = res.to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV", data=csv, file_name="player_finder_results.csv", mime="text/csv", key=unique_key("dl_pf"))
+            # show criteria values
+            crit_txts = []
+            for (s, _, _) in crits:
+                val = r.get(s, np.nan)
+                if pd.notna(val):
+                    crit_txts.append(f"<span class='pill'>{s}: <b>{val}</b></span>")
+                pct_name = f"{s} (pct)"
+                if pct_name in res.columns and pd.notna(r.get(pct_name, np.nan)):
+                    crit_txts.append(f"<span class='pill'>{s} pct: <b>{r.get(pct_name):.0f}</b></span>")
+
+            html = f"""
+              <div class="pcard">
+                <h4>{nm}</h4>
+                <div class="sub">{club} &nbsp;•&nbsp; {pos}</div>
+                <div class="kv"><b>Age:</b> {age} &nbsp; <b>Min:</b> {mins} &nbsp; <b>Rating:</b> {rat if pd.notna(rat) else '—'}</div>
+                <div class="kv" style="margin-top:4px;"><b>Transfer Value:</b> {tvtxt}</div>
+                <div class="metric-ct">{''.join(crit_txts)}</div>
+              </div>
+            """
+            cards.append(html)
+
+        st.markdown(f"""<div class="card-grid">{''.join(cards) if cards else '<em>No matches</em>'}</div>""", unsafe_allow_html=True)
+
+        # CSV download
+        st.download_button(
+            "Download CSV",
+            data=res.to_csv(index=False).encode("utf-8"),
+            file_name="player_finder_results.csv",
+            mime="text/csv",
+            key=unique_key("dl_pf")
+        )
 
 # ---------- PCA Map ----------
 elif mode == "PCA Map":
@@ -1180,35 +1567,34 @@ elif mode == "PCA Map":
             _plotly_axes_black(fig)
             st.plotly_chart(fig, use_container_width=True, theme=None)
 
-# ---------- Build: Metrics & Archetypes ----------
+# ---------- Build: Metrics & Archetypes (no expanders; always visible) ----------
 elif mode == "Build: Metrics & Archetypes":
-    st.subheader("Create metrics")
-    with st.expander("Add a custom metric", expanded=True):
-        colA, colOp, colB = st.columns([3,1,3])
-        with colA: a = st.selectbox("A", options=[None]+display_cols, index=0, key="cm_a")
-        with colOp: op = st.selectbox("Op", options=["+","-","*","/"], index=2, key="cm_op")
-        with colB: b = st.selectbox("B", options=[None]+display_cols, index=0, key="cm_b")
-        mname = st.text_input("Metric name", "")
-        color = st.color_picker("Color", "#1A78CF")
-        lib = st.checkbox("Less is better", value=False)
-        if st.button("Add metric", type="primary", key="btn_add_metric"):
-            if mname and a and b and op:
-                try:
-                    sa = pd.to_numeric(df_work[a], errors="coerce")
-                    sb = pd.to_numeric(df_work[b], errors="coerce")
-                    if op == "+": s = sa + sb
-                    elif op == "-": s = sa - sb
-                    elif op == "*": s = sa * sb
-                    elif op == "/": s = sa / sb.replace(0, np.nan)
-                    s = s.replace([np.inf, -np.inf], np.nan).round(2)
-                    df_work[mname] = s
-                    st.session_state["custom_metrics"][mname] = {"a":a,"op":op,"b":b,"color":color,"lib":lib}
-                    set_less_is_better(mname, lib)
-                    st.success(f"Added metric '{mname}'.")
-                except Exception as e:
-                    st.error(f"Failed to add metric: {e}")
-            else:
-                st.warning("Please fill A, Op, B and a name.")
+    st.subheader("Create a custom metric")
+    colA, colOp, colB = st.columns([3,1,3])
+    with colA: a = st.selectbox("A", options=[None]+display_cols, index=0, key="cm_a")
+    with colOp: op = st.selectbox("Op", options=["+","-","*","/"], index=2, key="cm_op")
+    with colB: b = st.selectbox("B", options=[None]+display_cols, index=0, key="cm_b")
+    mname = st.text_input("Metric name", "")
+    color = st.color_picker("Color", "#1A78CF")
+    lib = st.checkbox("Less is better", value=False)
+    if st.button("Add metric", type="primary", key="btn_add_metric"):
+        if mname and a and b and op:
+            try:
+                sa = pd.to_numeric(df_work[a], errors="coerce")
+                sb = pd.to_numeric(df_work[b], errors="coerce")
+                if op == "+": s = sa + sb
+                elif op == "-": s = sa - sb
+                elif op == "*": s = sa * sb
+                elif op == "/": s = sa / sb.replace(0, np.nan)
+                s = s.replace([np.inf, -np.inf], np.nan).round(2)
+                df_work[mname] = s
+                st.session_state["custom_metrics"][mname] = {"a":a,"op":op,"b":b,"color":color,"lib":lib}
+                set_less_is_better(mname, lib)
+                st.success(f"Added metric '{mname}'.")
+            except Exception as e:
+                st.error(f"Failed to add metric: {e}")
+        else:
+            st.warning("Please fill A, Op, B and a name.")
 
     st.markdown("**Existing custom metrics:**")
     if st.session_state["custom_metrics"]:
@@ -1216,18 +1602,39 @@ elif mode == "Build: Metrics & Archetypes":
     else:
         st.caption("No custom metrics yet.")
 
-    st.subheader("Create archetypes")
-    with st.expander("Add a custom archetype", expanded=False):
-        aname = st.text_input("Archetype name", key="arch_name")
-        astats = st.multiselect("Stats for this archetype", options=display_cols, key="arch_stats")
-        if st.button("Add archetype", key="btn_add_arch"):
-            if aname and astats:
-                st.session_state["custom_arches"][aname] = {"stats": astats}
-                st.success(f"Added archetype '{aname}'.")
-            else:
-                st.warning("Pick a name and at least one stat.")
+    st.subheader("Create a custom archetype")
+    aname = st.text_input("Archetype name", key="arch_name")
+    astats = st.multiselect("Stats for this archetype", options=display_cols, key="arch_stats")
 
-    # weights manager
+    # NEW: optional initial weights UI for selected stats
+    custom_init_weights = {}
+    if astats:
+        st.markdown("**Initial weights (per stat)**")
+        cols_w = st.columns(min(4, len(astats)))
+        for i, s in enumerate(astats):
+            with cols_w[i % len(cols_w)]:
+                custom_init_weights[s] = st.number_input(
+                    f"{s}",
+                    min_value=0.0,
+                    value=1.0,
+                    step=0.1,
+                    key=f"arch_w_{s}"
+                )
+
+    if st.button("Add archetype", key="btn_add_arch"):
+        if aname and astats:
+            # save the archetype
+            st.session_state["custom_arches"][aname] = {"stats": astats}
+            # NEW: persist the weights specifically for this custom archetype
+            if custom_init_weights:
+                st.session_state["arch_weights"][f"(Custom) {aname}"] = {
+                    s: float(custom_init_weights.get(s, 1.0)) for s in astats
+                }
+            st.success(f"Added archetype '{aname}' with weights.")
+        else:
+            st.warning("Pick a name and at least one stat.")
+
+
     st.subheader("Archetype Weights (per stat)")
     arch_all = all_archetypes_dict()
     if arch_all:
@@ -1242,34 +1649,38 @@ elif mode == "Build: Metrics & Archetypes":
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             if st.button("Save weights", key=f"aw_save_{w_arch}"):
-                set_arch_weights(w_arch, new_w); st.success("Saved.")
+                st.session_state["arch_weights"][w_arch] = {k: float(v) for k, v in new_w.items()}
+                st.success("Saved.")
         with c2:
             if st.button("Set equal weights", key=f"aw_eq_{w_arch}"):
-                set_arch_weights(w_arch, {s:1.0 for s in w_stats}); st.success("Reset to equal weights.")
+                st.session_state["arch_weights"][w_arch] = {s:1.0 for s in w_stats}
+                st.success("Reset to equal weights.")
         with c3:
             if st.button("Reset to defaults", key=f"aw_def_{w_arch}"):
-                set_arch_weights(w_arch, default_weights_for(w_arch, w_stats)); st.success("Reset to defaults.")
+                st.session_state["arch_weights"][w_arch] = default_weights_for(w_arch, w_stats)
+                st.success("Reset to defaults.")
         with c4:
             if st.button("Export all weights", key=f"aw_exp_all"):
                 payload = {"weights": st.session_state["arch_weights"]}
                 st.download_button("Download JSON", data=json.dumps(payload, indent=2).encode("utf-8"),
                                    file_name="all_archetype_weights.json", mime="application/json", key=unique_key("dl_allw"))
-        with st.expander("Import all weights JSON", expanded=False):
-            up = st.file_uploader("Upload JSON", type=["json"], key="aw_imp_all")
-            if up is not None:
-                try:
-                    data = json.loads(up.read().decode("utf-8"))
-                    if isinstance(data, dict) and "weights" in data and isinstance(data["weights"], dict):
-                        cleaned = {}
-                        for arch, wmap in data["weights"].items():
-                            if arch in arch_all and isinstance(wmap, dict):
-                                cleaned[arch] = {s: float(wmap.get(s, 1.0)) for s in arch_all[arch]}
-                        st.session_state["arch_weights"].update(cleaned)
-                        st.success("Imported weights.")
-                    else:
-                        st.error("JSON missing 'weights' object.")
-                except Exception as e:
-                    st.error(f"Import failed: {e}")
+
+        st.markdown("**Import all weights JSON**")
+        up = st.file_uploader("Upload JSON", type=["json"], key="aw_imp_all")
+        if up is not None:
+            try:
+                data = json.loads(up.read().decode("utf-8"))
+                if isinstance(data, dict) and "weights" in data and isinstance(data["weights"], dict):
+                    cleaned = {}
+                    for arch, wmap in data["weights"].items():
+                        if arch in arch_all and isinstance(wmap, dict):
+                            cleaned[arch] = {s: float(wmap.get(s, 1.0)) for s in arch_all[arch]}
+                    st.session_state["arch_weights"].update(cleaned)
+                    st.success("Imported weights.")
+                else:
+                    st.error("JSON missing 'weights' object.")
+            except Exception as e:
+                st.error(f"Import failed: {e}")
 
 # ---------- Table ----------
 elif mode == "Table":
