@@ -238,7 +238,7 @@ RENAME_MAP = {
     "Goals Outside Box":"Goals Outside Box","xSv %":"Expected Save %","xGP/90":"Expected Goals Prevented/90","xGP":"Expected Goals Prevented",
     "Drb/90":"Dribbles/90","Drb":"Dribbles","Distance":"Distance Covered (KM)","Cr C/90":"Crosses Completed/90","Cr C":"Crosses Completed",
     "Crs A/90":"Crosses Attempted/90","Cr A":"Crosses Attempted","Cr C/A":"Cross Completion Ratio","Conv %":"Conversion Rate",
-    "Clr/90":"Clearances/90","Clear":"Clearances","CCC":"Chances Created","Ch C/90":"Chances Created/90","Blk/90":"Blocks/90","Blk":"Blocks",
+    "Clr/90":"Clearances/90","Clear":"Clearances","CCC":"Chances Created","Ch C/90":"Chances Created/90","Blk/90":"Blocks/90","Blk":"Blocks", "Aer A/90":"Aerial Duels Attempted/90"
 }
 
 CREATE_PER90_FROM_TOTAL = {
@@ -262,16 +262,48 @@ def apply_hard_remap(df_in: pd.DataFrame) -> pd.DataFrame:
         df[c] = _series_for(df, c)
     df = df.loc[:, ~df.columns.duplicated(keep="first")]
 
-    # rename to canonical
+    # ---- rename to canonical where we have a hard mapping ----
     df.columns = [RENAME_MAP.get(c, c) for c in df.columns]
 
-    # try to make columns numeric where appropriate
+    # ---- Distance: strip trailing "km"/"KM" from cell values, then normalise name ----
+    # Look for any distance-like column names
+    dist_cols_exact = [c for c in df.columns if c in {
+        "Distance Covered (KM)", "Distance Covered", "Distance"
+    }]
+    dist_cols_loose = [c for c in df.columns if re.search(r"\bdistance\b", c, flags=re.I)]
+
+    # Clean cell values on all candidates first (before numeric coercion)
+    for c in set(dist_cols_exact or dist_cols_loose):
+        try:
+            df[c] = (
+                df[c].astype(str)
+                     .str.replace(r"\s*[kK][mM]\s*$", "", regex=True)  # strip trailing "km"
+                     .str.strip()
+            )
+        except Exception:
+            pass
+
+    # Canonicalise the distance column name so /90 logic always picks it up
+    if "Distance Covered (KM)" not in df.columns:
+        # Prefer a more specific header if present
+        if "Distance Covered" in df.columns:
+            df.rename(columns={"Distance Covered": "Distance Covered (KM)"}, inplace=True)
+        elif "Distance" in df.columns:
+            df.rename(columns={"Distance": "Distance Covered (KM)"}, inplace=True)
+        else:
+            # Fall back to any loose distance-like column
+            for c in dist_cols_loose:
+                if c != "Distance Covered (KM)" and "/90" not in c:
+                    df.rename(columns={c: "Distance Covered (KM)"}, inplace=True)
+                    break
+
+    # ---- try to make columns numeric where appropriate ----
     for c in df.columns:
         if df[c].dtype == object:
             df[c] = _maybe_numeric(df[c])
 
-    # minutes denom for /90
-    min_name = find_col(df, ["Minutes","Mins","Min","Time Played"])
+    # ---- minutes denominator (for /90) ----
+    min_name = find_col(df, ["Minutes", "Mins", "Min", "Time Played"])
     denom = None
     if min_name:
         mins = pd.to_numeric(df[min_name], errors="coerce")
@@ -282,22 +314,25 @@ def apply_hard_remap(df_in: pd.DataFrame) -> pd.DataFrame:
             if src in df.columns and tgt not in df.columns:
                 s = pd.to_numeric(df[src], errors="coerce")
                 df[tgt] = (s / denom).round(2)
+
+        # Distance per 90 (works now that name is canonical + values cleaned)
         if "Distance Covered (KM)" in df.columns and "Distance Covered (KM)/90" not in df.columns:
             s = pd.to_numeric(df["Distance Covered (KM)"], errors="coerce")
             df["Distance Covered (KM)/90"] = (s / denom).round(2)
 
-    # xG/Shot (computed fresh)
-    xg_col = find_col(df, ["Expected Goals","xG"])
+    # ---- xG/Shot (computed fresh) ----
+    xg_col = find_col(df, ["Expected Goals", "xG"])
     shots_col = find_col(df, ["Shots"])
     if xg_col and shots_col:
         xg = pd.to_numeric(df[xg_col], errors="coerce")
         sh = pd.to_numeric(df[shots_col], errors="coerce").replace(0, np.nan)
         df["xG/Shot"] = (xg / sh).round(3)
 
-    # round all float cols to 2 dp
+    # ---- round all float cols to 2 dp ----
     float_cols = df.select_dtypes(include="float").columns
     df[float_cols] = df[float_cols].round(2)
     return df
+
 
 
 # =========================
@@ -980,9 +1015,12 @@ MODES = [
     "Build: Metrics & Archetypes",
     "Table",
 ]
-mode = st.radio("Mode", MODES, horizontal=True, index=MODES.index(st.session_state.get("last_mode", MODES[0])))
-st.session_state["last_mode"] = mode
-st.write("")  # small spacing
+# Stable, single-click mode selector
+if "mode" not in st.session_state:
+    st.session_state["mode"] = MODES[0]
+mode = st.radio("Mode", MODES, horizontal=True, key="mode")  # no index arg
+st.write("")  # tiny spacer
+
 
 # ==== SIDEBAR FILTERS (minutes, player search, role, baseline, positions) ====
 st.sidebar.header("Filters")
@@ -1044,11 +1082,17 @@ else:
 
 # Percentiles baseline mode (affects pizzas, bars, role scores, etc.)
 st.sidebar.subheader("Percentile Baseline")
-st.session_state["pct_baseline_mode"] = st.sidebar.radio(
+# Default once
+if "pct_baseline_mode" not in st.session_state:
+    st.session_state["pct_baseline_mode"] = "Role baseline"
+
+# Let Streamlit own the value; no index juggling, no manual assignment
+st.sidebar.radio(
     "Compute percentiles against",
     ["Role baseline", "Sidebar positions", "Whole dataset"],
-    index={"Role baseline":0,"Sidebar positions":1,"Whole dataset":2}[st.session_state.get("pct_baseline_mode","Role baseline")]
+    key="pct_baseline_mode",
 )
+
 
 # Sidebar positional cohort for "Sidebar positions" mode
 st.sidebar.subheader("Positions cohort")
@@ -1509,6 +1553,153 @@ elif mode == "Top 10 — Roles":
         )
         _plotly_axes_black(fig)
         st.plotly_chart(fig, use_container_width=True, theme=None)
+
+# ---------- Build: Metrics & Archetypes (custom metrics + custom/override roles) ----------
+elif mode == "Build: Metrics & Archetypes":
+    st.subheader("Create a custom metric")
+
+    # Column choices
+    numeric_like = [c for c in df_work.columns if pd.api.types.is_numeric_dtype(df_work[c])]
+    for c in df_work.columns:
+        if c not in numeric_like and df_work[c].dtype == object:
+            if pd.to_numeric(df_work[c], errors="coerce").notna().mean() > 0.55:
+                numeric_like.append(c)
+    numeric_like = sorted(set(numeric_like))
+
+    colA, colOp, colB = st.columns([3,1,3])
+    with colA:
+        a = st.selectbox("A", options=[None] + numeric_like, index=0, key="cm_a")
+    with colOp:
+        op = st.selectbox("Op", options=["+","-","*","/"], index=2, key="cm_op")
+    with colB:
+        b = st.selectbox("B", options=[None] + numeric_like, index=0, key="cm_b")
+
+    mname = st.text_input("Metric name (new column)", "")
+    lib = st.checkbox("Less is better for this metric", value=False, help="Affects percentile direction")
+
+    c1, c2 = st.columns([1,1])
+    with c1:
+        if st.button("Add metric", type="primary", key="btn_add_metric"):
+            if mname and a and b and op:
+                try:
+                    sa = pd.to_numeric(df_work[a], errors="coerce")
+                    sb = pd.to_numeric(df_work[b], errors="coerce")
+                    if op == "+": s = sa + sb
+                    elif op == "-": s = sa - sb
+                    elif op == "*": s = sa * sb
+                    elif op == "/": s = sa / sb.replace(0, np.nan)
+                    s = s.replace([np.inf, -np.inf], np.nan).round(2)
+                    df_work[mname] = s
+                    set_less_is_better(mname, lib)
+                    st.success(f"Added metric '{mname}'.")
+                except Exception as e:
+                    st.error(f"Failed to add metric: {e}")
+            else:
+                st.warning("Please fill A, Op, B and a name.")
+    with c2:
+        if st.button("Remove metric column", key="btn_rm_metric"):
+            if mname and mname in df_work.columns:
+                df_work.drop(columns=[mname], inplace=True, errors="ignore")
+                st.success(f"Removed column '{mname}'.")
+            else:
+                st.info("Enter an existing column name to remove.")
+
+    st.markdown("---")
+    st.subheader("Create / Edit Custom Role (unified: stat → weight)")
+
+    # Custom role builder
+    role_name_new = st.text_input("Role name (new or existing)")
+    pick_stats = st.multiselect("Stats for this role", options=numeric_like, help="Choose stats; assign a weight to each.")
+
+    weights_map = {}
+    if pick_stats:
+        cols_w = st.columns(min(4, len(pick_stats)))
+        for i, s in enumerate(pick_stats):
+            with cols_w[i % len(cols_w)]:
+                weights_map[s] = st.number_input(f"{s}", min_value=0.0, value=1.0, step=0.1, key=f"rbw_{s}")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Save Custom Role", key="btn_save_custom_role"):
+            if role_name_new and weights_map:
+                st.session_state["role_book_custom"][role_name_new] = {
+                    "baseline": None,  # uses sidebar cohort unless you override below
+                    "weights": {k: float(v) for k, v in weights_map.items()},
+                }
+                st.success(f"Saved custom role '{role_name_new}'.")
+            else:
+                st.warning("Provide a role name and at least one stat.")
+    with c2:
+        if st.button("Delete Custom Role", key="btn_del_custom_role"):
+            if role_name_new and role_name_new in st.session_state["role_book_custom"]:
+                st.session_state["role_book_custom"].pop(role_name_new, None)
+                st.success(f"Deleted custom role '{role_name_new}'.")
+            else:
+                st.info("Enter an existing custom role name to delete.")
+    with c3:
+        st.caption("Tip: This saves in session. Export/import below to persist.")
+
+    # Override a built-in role (edit weights; keep built-in baseline)
+    st.markdown("---")
+    st.subheader("Override a Built-in Role (edit weights)")
+
+    built_names = [k for k in ROLE_BOOK_BUILTIN.keys()]
+    if built_names:
+        target = st.selectbox("Built-in role to override", built_names, key="override_pick")
+        base_cfg = ROLE_BOOK_BUILTIN.get(target, {})
+        base_weights = dict(base_cfg.get("weights", {}))
+        if not base_weights:
+            st.info("This role has no weight map; nothing to override.")
+        else:
+            cols = st.columns(min(4, len(base_weights)))
+            new_w = {}
+            for i, (stat, w) in enumerate(sorted(base_weights.items())):
+                with cols[i % len(cols)]:
+                    new_w[stat] = st.number_input(stat, min_value=0.0, value=float(w), step=0.1, key=f"ov_{target}_{stat}")
+            if st.button("Save override", key="btn_save_override"):
+                st.session_state["role_book_custom"][target] = {
+                    "baseline": base_cfg.get("baseline", None),
+                    "weights": {k: float(v) for k, v in new_w.items()},
+                }
+                st.success(f"Saved override for '{target}'.")
+    else:
+        st.caption("No built-in roles found.")
+
+    # Export / Import all custom roles
+    st.markdown("---")
+    st.subheader("Export / Import Custom Roles")
+
+    exp_payload = {"roles": st.session_state["role_book_custom"]}
+    st.download_button(
+        "Download custom roles JSON",
+        data=json.dumps(exp_payload, indent=2).encode("utf-8"),
+        file_name="custom_roles.json",
+        mime="application/json",
+        key=unique_key("dl_custom_roles")
+    )
+
+    up = st.file_uploader("Upload custom roles JSON", type=["json"], key="ul_custom_roles")
+    if up is not None:
+        try:
+            data = json.loads(up.read().decode("utf-8"))
+            if isinstance(data, dict) and "roles" in data and isinstance(data["roles"], dict):
+                # coerce shapes
+                cleaned = {}
+                for rname, cfg in data["roles"].items():
+                    if not isinstance(cfg, dict): continue
+                    w = cfg.get("weights", {})
+                    if isinstance(w, dict) and w:
+                        cleaned[rname] = {
+                            "baseline": cfg.get("baseline", None),
+                            "weights": {str(s): float(wv) for s, wv in w.items()},
+                        }
+                st.session_state["role_book_custom"].update(cleaned)
+                st.success(f"Imported {len(cleaned)} custom role(s).")
+            else:
+                st.error("JSON must have a top-level 'roles' object.")
+        except Exception as e:
+            st.error(f"Import failed: {e}")
+
 
 # ---------- Top 10 — Stats (percentile leaders; dynamic color; hover shows value 2dp) ----------
 elif mode == "Top 10 — Stats":
