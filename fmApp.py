@@ -103,20 +103,66 @@ st.markdown("""
 def unique_key(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:8]}"
 
+# Treat any dash-only token as missing (NaN)
+DASH_ONLY_RE = r"^[\s\-\u2010\u2011\u2012\u2013\u2014\u2212]+$"  # -, ‐, -, ‒, –, —, −
+
 def _clean_num(s: pd.Series) -> pd.Series:
-    return (s.astype(str)
-              .str.replace(",", "", regex=False)
-              .str.replace("%", "", regex=False)
-              .str.replace("−", "-", regex=False)
-              .str.strip())
+    """
+    Numeric cleaner:
+      - remove commas, percent signs
+      - strip a trailing 'km' (case-insensitive)
+      - trim whitespace
+      - if the remaining text is only dashes/whitespace -> '0'
+    """
+    s = (
+        s.astype(str)
+         .str.replace(",", "", regex=False)
+         .str.replace("%", "", regex=False)
+         .str.replace(r"(?i)\s*km\b", "", regex=True)  # kill 'km' suffix before parsing
+         .str.strip()
+    )
+
+    # dash-only -> "0"
+    s = s.mask(s.str.fullmatch(DASH_ONLY_RE), "0")
+
+    # (optional) turn true empties into NaN:
+    # s = s.replace("", np.nan)
+
+    return s
+
+
 
 def _maybe_numeric(col: pd.Series) -> pd.Series:
-    s_clean = _clean_num(col)
+    # Only operate on real Series; otherwise leave as-is
+    if not isinstance(col, pd.Series):
+        return col
+
+    s_clean = _clean_num(col)                         # handles dashes -> "0", strips %, commas, km
     num = pd.to_numeric(s_clean, errors="coerce")
+
+    # how many numeric entries do we have?
     valid = int(num.notna().sum())
-    if valid >= max(4, int(0.55 * len(num))):
+    length = len(num)
+
+    # convert if the column is mostly numeric (or at least a few values)
+    if valid >= max(4, int(0.55 * length)):
         return num
     return col
+
+
+# ---- Force numeric for sparse-but-important columns (GK esp.) ----
+GK_FORCE_COLS = [
+    "Save %", "Expected Save %", "Expected Goals Prevented/90",
+    "Saves Held", "Saves Parried", "Saves Tipped",
+    "Conceded/90", "Clean Sheets/90",
+]
+
+def force_numeric_cols(df: pd.DataFrame, cols: List[str]) -> None:
+    """Coerce selected columns to numeric regardless of sparsity."""
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(_clean_num(df[c]), errors="coerce")
+
 
 def _series_for(df: pd.DataFrame, col_name: str) -> pd.Series:
     v = df[col_name]
@@ -128,7 +174,10 @@ def _series_for(df: pd.DataFrame, col_name: str) -> pd.Series:
         scores = []
         for i in range(v.shape[1]):
             s = pd.to_numeric(_clean_num(v.iloc[:, i]), errors="coerce")
+            if not isinstance(s, pd.Series):          # <- guard for rare scalar cases
+                s = pd.Series([s])
             scores.append(int(s.notna().sum()))
+
         best_i = int(np.argmax(scores))
         return v.iloc[:, best_i]
     return v
@@ -224,7 +273,7 @@ RENAME_MAP = {
     "Tck/90":"Tackles/90","Tck W":"Tackles Won","Tck A":"Tackles Attempted","Tck R":"Tackle Ratio",
     "Shot/90":"Shots/90","Shot %":"Shot on Target Ratio","ShT/90":"SoT/90","ShT":"Shots on Target",
     "Shots Outside Box/90":"Shots Outside Box/90","Shts Blckd/90":"Shots Blocked/90","Shts Blckd":"Shots Blocked",
-    "Shots":"Shots","Svt":"Saves Tipped","Svp":"Saves Parried","Svh":"Saves Held","Sv %":"Save %",
+    "Shots":"Shots","Svt":"Saves Tipped","Svp":"Saves Parried","Svh":"Saves Held","Sv %":"Save Ratio",
     "Pr passes/90":"Progressive Passes/90","Pr Passes":"Progressive Passes",
     "Pres C/90":"Pressures Completed/90","Pres C":"Pressures Completed","Pres A/90":"Pressures Attempted/90","Pres A":"Pressures Attempted",
     "Poss Won/90":"Possession Won/90","Poss Lost/90":"Possession Lost/90","Ps C/90":"Passes Completed/90","Ps C":"Passes Completed",
@@ -235,14 +284,13 @@ RENAME_MAP = {
     "Off":"Offsides","Gl Mst":"Mistakes Leading to Goal","K Tck/90":"Key Tackles/90","K Tck":"Key Tackles",
     "K Ps/90":"Key Passes/90","K Pas":"Key Passes","K Hdrs/90":"Key Headers/90","Int/90":"Interceptions/90","Itc":"Interceptions",
     "Sprints/90":"Sprint/90","Hdr %":"Header Win Rate","Hdrs W/90":"Headers won/90","Hdrs":"Headers","Hdrs L/90":"Headers Lost/90",
-    "Goals Outside Box":"Goals Outside Box","xSv %":"Expected Save %","xGP/90":"Expected Goals Prevented/90","xGP":"Expected Goals Prevented",
+    "Goals Outside Box":"Goals Outside Box","xGP/90":"Expected Goals Prevented/90","xGP":"Expected Goals Prevented",
     "Drb/90":"Dribbles/90","Drb":"Dribbles","Distance":"Distance Covered (KM)","Cr C/90":"Crosses Completed/90","Cr C":"Crosses Completed",
     "Crs A/90":"Crosses Attempted/90","Cr A":"Crosses Attempted","Cr C/A":"Cross Completion Ratio","Conv %":"Conversion Rate",
     "Clr/90":"Clearances/90","Clear":"Clearances","CCC":"Chances Created","Ch C/90":"Chances Created/90","Blk/90":"Blocks/90","Blk":"Blocks", "Aer A/90":"Aerial Duels Attempted/90"
 }
 
 CREATE_PER90_FROM_TOTAL = {
-    "Tackles Won": "Tackles Won/90",
     "Interceptions": "Interceptions/90",
     "Shots Blocked": "Shots Blocked/90",
     "Blocks": "Blocks/90",
@@ -262,48 +310,16 @@ def apply_hard_remap(df_in: pd.DataFrame) -> pd.DataFrame:
         df[c] = _series_for(df, c)
     df = df.loc[:, ~df.columns.duplicated(keep="first")]
 
-    # ---- rename to canonical where we have a hard mapping ----
+    # rename to canonical
     df.columns = [RENAME_MAP.get(c, c) for c in df.columns]
 
-    # ---- Distance: strip trailing "km"/"KM" from cell values, then normalise name ----
-    # Look for any distance-like column names
-    dist_cols_exact = [c for c in df.columns if c in {
-        "Distance Covered (KM)", "Distance Covered", "Distance"
-    }]
-    dist_cols_loose = [c for c in df.columns if re.search(r"\bdistance\b", c, flags=re.I)]
-
-    # Clean cell values on all candidates first (before numeric coercion)
-    for c in set(dist_cols_exact or dist_cols_loose):
-        try:
-            df[c] = (
-                df[c].astype(str)
-                     .str.replace(r"\s*[kK][mM]\s*$", "", regex=True)  # strip trailing "km"
-                     .str.strip()
-            )
-        except Exception:
-            pass
-
-    # Canonicalise the distance column name so /90 logic always picks it up
-    if "Distance Covered (KM)" not in df.columns:
-        # Prefer a more specific header if present
-        if "Distance Covered" in df.columns:
-            df.rename(columns={"Distance Covered": "Distance Covered (KM)"}, inplace=True)
-        elif "Distance" in df.columns:
-            df.rename(columns={"Distance": "Distance Covered (KM)"}, inplace=True)
-        else:
-            # Fall back to any loose distance-like column
-            for c in dist_cols_loose:
-                if c != "Distance Covered (KM)" and "/90" not in c:
-                    df.rename(columns={c: "Distance Covered (KM)"}, inplace=True)
-                    break
-
-    # ---- try to make columns numeric where appropriate ----
+    # Coerce numeric where appropriate (uses _clean_num so dash-only -> NaN)
     for c in df.columns:
         if df[c].dtype == object:
             df[c] = _maybe_numeric(df[c])
 
-    # ---- minutes denominator (for /90) ----
-    min_name = find_col(df, ["Minutes", "Mins", "Min", "Time Played"])
+    # Minutes denom for /90
+    min_name = find_col(df, ["Minutes","Mins","Min","Time Played"])
     denom = None
     if min_name:
         mins = pd.to_numeric(df[min_name], errors="coerce")
@@ -314,23 +330,31 @@ def apply_hard_remap(df_in: pd.DataFrame) -> pd.DataFrame:
             if src in df.columns and tgt not in df.columns:
                 s = pd.to_numeric(df[src], errors="coerce")
                 df[tgt] = (s / denom).round(2)
-
-        # Distance per 90 (works now that name is canonical + values cleaned)
         if "Distance Covered (KM)" in df.columns and "Distance Covered (KM)/90" not in df.columns:
             s = pd.to_numeric(df["Distance Covered (KM)"], errors="coerce")
             df["Distance Covered (KM)/90"] = (s / denom).round(2)
 
-    # ---- xG/Shot (computed fresh) ----
-    xg_col = find_col(df, ["Expected Goals", "xG"])
+    # xG/Shot (computed fresh)
+    xg_col = find_col(df, ["Expected Goals","xG"])
     shots_col = find_col(df, ["Shots"])
     if xg_col and shots_col:
         xg = pd.to_numeric(df[xg_col], errors="coerce")
         sh = pd.to_numeric(df[shots_col], errors="coerce").replace(0, np.nan)
         df["xG/Shot"] = (xg / sh).round(3)
 
-    # ---- round all float cols to 2 dp ----
+    # ---- Round and then fill NaNs (incl. dash-only -> NaN) with 0 for numeric columns ----
     float_cols = df.select_dtypes(include="float").columns
-    df[float_cols] = df[float_cols].round(2)
+    df[float_cols] = df[float_cols].round(2).fillna(0.0)
+
+    # If you want the same for ints, convert safely and fill:
+    # (many “int-ish” columns are already float because NaN existed earlier)
+    for c in df.columns:
+        if df[c].dtype == object:
+            # try a final numeric coercion for object columns; dash-only will be NaN -> then 0
+            num = pd.to_numeric(_clean_num(df[c]), errors="coerce")
+            if num.notna().sum() >= int(0.55 * len(num)) or num.notna().any():
+                df[c] = num.fillna(0)
+
     return df
 
 
@@ -482,7 +506,7 @@ ROLE_BOOK_BUILTIN: Dict[str, Dict[str, object]] = {
     "GK — Shot Stopper": {
         "baseline": ["GK"],
         "weights": {
-            "Save %": 2.0, "Expected Save %": 1.0, "Expected Goals Prevented/90": 1.7,
+            "Expected Goals Prevented/90": 1.7,
             "Saves Held": 1.2, "Saves Parried": 0.8, "Saves Tipped": 0.6,
             "Conceded/90": 1.2, "Clean Sheets/90": 0.9
         },
@@ -492,7 +516,7 @@ ROLE_BOOK_BUILTIN: Dict[str, Dict[str, object]] = {
         "weights": {
             "Passes Attempted/90": 1.2, "Passes Completed/90": 0.9, "Pass Completion%": 0.9,
             "Progressive Passes/90": 1.6, "Expected Goals Prevented/90": 1.1,
-            "Save %": 1.1, "Saves Held": 0.7, "Saves Parried": 0.5
+            "Saves Held": 0.7, "Saves Parried": 0.5
         },
     },
 
@@ -500,7 +524,7 @@ ROLE_BOOK_BUILTIN: Dict[str, Dict[str, object]] = {
     "CB — Stopper": {
         "baseline": ["D (C)"],
         "weights": {
-            "Tackles/90": 1.5, "Tackles Won/90": 1.7, "Tackle Ratio": 1.2,
+            "Tackles/90": 1.5, "Tackle Ratio": 1.2,
             "Interceptions/90": 1.3, "Blocks/90": 1.1, "Shots Blocked/90": 1.0,
             "Clearances/90": 1.0, "Headers won/90": 1.1, "Header Win Rate": 1.1
         },
@@ -537,7 +561,7 @@ ROLE_BOOK_BUILTIN: Dict[str, Dict[str, object]] = {
     "DM — Ball Winner": {
         "baseline": ["DM"],
         "weights": {
-            "Tackles/90": 1.6, "Tackles Won/90": 1.7, "Tackle Ratio": 1.3,
+            "Tackles/90": 1.6, "Tackle Ratio": 1.3,
             "Interceptions/90": 1.6, "Blocks/90": 1.2, "Shots Blocked/90": 1.2,
             "Possession Won/90": 1.5, "Pressures Completed/90": 1.2
         },
@@ -745,32 +769,30 @@ def pick_baseline_df_for(role_name: Optional[str]) -> pd.DataFrame:
     return BASELINE_DF if not BASELINE_DF.empty else df_work
 
 
-def role_scores_for_role(role_name: str) -> pd.Series:
+# ==== Role book helpers ====
+
+def role_scores_for_role(role_name: str, base_df_override: Optional[pd.DataFrame] = None) -> pd.Series:
     """
     Weighted sum of per-stat percentiles (0..100), normalized by weight sum.
-    Never raises; returns NaNs if no usable stats.
+    If base_df_override is provided, percentiles are computed against that DF.
     """
     weights = role_weights_for(role_name)
-    # intersect with present numeric columns
     usable = {s: w for s, w in weights.items() if s in df_work.columns and pd.api.types.is_numeric_dtype(df_work[s])}
     if not usable:
         return pd.Series(np.nan, index=df_work.index)
 
-    base_df = pick_baseline_df_for(role_name)
-    # per-stat percentiles
-    pct_cols = {}
-    for s, w in usable.items():
-        pct_cols[s] = column_percentiles(df_work[s], base_df[s], is_less_better(s))
+    # <- NEW: allow override (e.g., whole dataset)
+    base_df = base_df_override if base_df_override is not None else pick_baseline_df_for(role_name)
 
-    # weighted sum / weight_sum
     W = sum(abs(float(w)) for w in usable.values()) or 1.0
     out = None
     for s, w in usable.items():
-        col = pct_cols[s].astype(float)
-        contrib = col * float(w) / W
+        pct = column_percentiles(df_work[s], base_df[s], is_less_better(s)).astype(float)
+        contrib = pct * float(w) / W
         out = contrib if out is None else (out + contrib)
 
     return out.clip(0, 100)
+
 
 
 ###############
@@ -981,23 +1003,28 @@ for fname, label in [
     else:
         st.sidebar.caption(f"*{fname} not found in working directory.*")
 
+
 @st.cache_data(show_spinner=True)
 def parse_and_cache(name: str, raw: bytes) -> Tuple[pd.DataFrame, str]:
-    if name.lower().endswith((".html", ".htm")):
+    if name.lower().endswith((".html",".htm")):
         dfp = read_fm_html(io.BytesIO(raw))
     else:
         dfp = pd.read_csv(io.BytesIO(raw))
         dfp = _sanitize_df(dfp)
+
     dfp = apply_hard_remap(dfp)
 
+    # --- NEW: make GK stats numeric even if sparse ----
+    force_numeric_cols(dfp, GK_FORCE_COLS)
+
     # build position tokens
-    pos_col0 = find_col(dfp, ["Pos", "Position"])
+    pos_col0 = find_col(dfp, ["Pos","Position"])
     if pos_col0 is None:
         dfp["__pos_tokens"] = [[] for _ in range(len(dfp))]
     else:
         dfp["__pos_tokens"] = dfp[pos_col0].apply(expand_positions)
 
-    # downcast + ensure floats are 2dp (already rounded in remap)
+    # downcast + ensure floats are 2dp
     for c in dfp.select_dtypes(include="float").columns:
         dfp[c] = pd.to_numeric(dfp[c], errors="coerce", downcast="float").round(2)
     for c in dfp.select_dtypes(include="integer").columns:
@@ -1005,6 +1032,7 @@ def parse_and_cache(name: str, raw: bytes) -> Tuple[pd.DataFrame, str]:
 
     cache_id = f"{hash((name, dfp.shape, tuple(dfp.columns)))}"
     return dfp, cache_id
+
 
 # Parse on demand
 df = pd.DataFrame()
@@ -1029,11 +1057,12 @@ pos_col  = find_col(df_work, ["Pos","Position"]) or "Pos"
 
 # ==== TOP MODE SELECTOR (in main area) ====
 MODES = [
-    "Pizza & Archetypes",    # matplotlib pizza only
+    "Pizza & Archetypes",
     "Percentile Bars",
     "Distribution",
     "Stat Scatter",
     "Role Scatter",
+    "Best Roles",          # <-- NEW
     "Top 10 — Roles",
     "Top 10 — Stats",
     "Player Finder",
@@ -1324,33 +1353,48 @@ elif mode == "Percentile Bars":
 elif mode == "Distribution":
     st.subheader("Distribution")
     numeric_cols = [c for c in df_work.columns if pd.api.types.is_numeric_dtype(df_work[c])]
-    # include numeric-like objects too
     for c in df_work.columns:
         if c not in numeric_cols and df_work[c].dtype == object:
             if pd.to_numeric(df_work[c], errors="coerce").notna().mean() > 0.55:
                 numeric_cols.append(c)
+
     if not numeric_cols:
         st.info("No numeric columns available.")
     else:
         stat = st.selectbox("Stat", sorted(set(numeric_cols)))
-        base_df = pick_baseline_df_for(st.session_state.get("active_role") if st.session_state.get("pct_baseline_mode")=="Role baseline" else None)
+
+        # --- IMPORTANT: Distribution ignores "Role baseline"
+        pct_mode = st.session_state.get("pct_baseline_mode", "Role baseline")
+        if pct_mode in ("Role baseline", "Sidebar positions"):
+            base_df = BASELINE_DF if not BASELINE_DF.empty else df_work
+            cohort_label = "Sidebar positions"
+        else:
+            base_df = df_work
+            cohort_label = "Whole dataset"
+
         series = pd.to_numeric(base_df[stat], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
         fig = px.histogram(series, nbins=40)
-        fig.update_traces(marker_line_color="black", marker_line_width=1, hovertemplate="Count: %{y}<br>Bin: %{x}<extra></extra>")
+        fig.update_traces(
+            marker_line_color="black",
+            marker_line_width=1,
+            hovertemplate="Count: %{y}<br>Bin: %{x}<extra></extra>"
+        )
 
-        # Player marker: bold red line + annotation
+        # Player marker
         try:
             pval = float(pd.to_numeric(df_work.loc[player_row.name, stat], errors="coerce"))
             fig.add_vline(x=pval, line_color="#D70232", line_width=3)
-            fig.add_annotation(x=pval, y=1.05, xref="x", yref="paper",
-                               text=f"{player_row[name_col]} ({pval:.2f})",
-                               showarrow=True, arrowhead=2, arrowcolor="#D70232",
-                               bgcolor="white", bordercolor="#D70232")
+            fig.add_annotation(
+                x=pval, y=1.05, xref="x", yref="paper",
+                text=f"{player_row[name_col]} ({pval:.2f})",
+                showarrow=True, arrowhead=2, arrowcolor="#D70232",
+                bgcolor="white", bordercolor="#D70232"
+            )
         except Exception:
             pass
 
         fig.update_layout(
-            title=f"Distribution of {stat} — Baseline: {'Role' if st.session_state.get('pct_baseline_mode')=='Role baseline' else ('Sidebar' if st.session_state.get('pct_baseline_mode')=='Sidebar positions' else 'Whole dataset')}",
+            title=f"Distribution of {stat} — Cohort: {cohort_label}",
             template="simple_white",
             paper_bgcolor=POSTER_BG, plot_bgcolor=POSTER_BG,
             font=dict(family=FONT_FAMILY),
@@ -1360,13 +1404,17 @@ elif mode == "Distribution":
         st.plotly_chart(fig, use_container_width=True, theme=None)
 
 # ---------- Stat Scatter (always show points; highlight search) ----------
+# ---------- Stat Scatter (always show points; highlight search) ----------
 elif mode == "Stat Scatter":
     st.subheader("Stat Scatter")
+
+    # collect numeric columns (including numeric-like objects)
     numeric_cols = [c for c in df_work.columns if pd.api.types.is_numeric_dtype(df_work[c])]
     for c in df_work.columns:
         if c not in numeric_cols and df_work[c].dtype == object:
             if pd.to_numeric(df_work[c], errors="coerce").notna().mean() > 0.55:
                 numeric_cols.append(c)
+
     if not numeric_cols:
         st.info("No numeric columns found.")
     else:
@@ -1381,40 +1429,68 @@ elif mode == "Stat Scatter":
         u21 = st.checkbox("Highlight U21", value=False, disabled=not age_ok, key="stat_u21")
         hi_name = st.text_input("Highlight player (type to search)", "", key="stat_hi_q")
 
+        # build display frame from the current cohort
         df_disp = BASELINE_DF[[name_col]].copy()
-        if "Club" in BASELINE_DF.columns: df_disp["Club"] = BASELINE_DF["Club"]
-        if pos_col in BASELINE_DF.columns: df_disp["Pos"] = BASELINE_DF[pos_col]
+
+        # ensure consistent Club/Pos columns exist for hover (create blanks if missing)
+        if "Club" in BASELINE_DF.columns:
+            df_disp["Club"] = BASELINE_DF["Club"].astype(str)
+        else:
+            df_disp["Club"] = ""
+
+        if pos_col in BASELINE_DF.columns:
+            df_disp["Pos"] = BASELINE_DF[pos_col].astype(str)
+        else:
+            df_disp["Pos"] = ""
+
+        # numeric x/y and drop rows with missing values for these axes
         df_disp[xstat] = pd.to_numeric(BASELINE_DF[xstat], errors="coerce")
         df_disp[ystat] = pd.to_numeric(BASELINE_DF[ystat], errors="coerce")
         df_disp = df_disp.dropna(subset=[xstat, ystat])
 
-        # Consistent hover on base layer
-        hover_tmpl = "<b>%{hovertext}</b><br>Club: %{customdata[0]}<br>Pos: %{customdata[1]}<br>" \
-                     + f"{xstat}: %{{x:.2f}}<br>{ystat}: %{{y:.2f}}<extra></extra>"
-        fig = px.scatter(df_disp, x=xstat, y=ystat, hover_name=name_col,
-                         hover_data={name_col:False, "Club":True, "Pos":True, xstat:":.2f", ystat:":.2f"},
-                         opacity=0.9)
+        # scatter with column-name based custom_data (avoids length mismatch)
+        fig = px.scatter(
+            df_disp,
+            x=xstat,
+            y=ystat,
+            custom_data=[name_col, "Club", "Pos"],  # <-- column names, not arrays
+            opacity=0.95
+        )
+
+        # unified hover (always Name, Club, Pos + stats)
+        hover_tmpl = (
+            "<b>%{customdata[0]}</b>"
+            "<br>Club: %{customdata[1]}"
+            "<br>Pos: %{customdata[2]}"
+            f"<br>{xstat}: %{{x:.2f}}"
+            f"<br>{ystat}: %{{y:.2f}}"
+            "<extra></extra>"
+        )
         for tr in fig.data:
             tr.marker.update(size=8, line=dict(width=1, color="black"))
             tr.update(hovertemplate=hover_tmpl)
 
-        # overlays for age (visual only; keep base hover intact)
+        # overlays for age cohorts (visual only)
         if age_ok:
             ages = pd.to_numeric(BASELINE_DF["Age"], errors="coerce")
+
             if u23:
                 cohort_ix = BASELINE_DF.index[ages < 23]
                 cohort = df_disp.loc[df_disp.index.intersection(cohort_ix)]
                 fig.add_trace(go.Scatter(
                     x=cohort[xstat], y=cohort[ystat], mode="markers",
-                    marker=dict(size=14, color="rgba(0,135,68,0.25)", line=dict(width=2, color="rgba(0,135,68,0.9)")),
+                    marker=dict(size=14, color="rgba(0,135,68,0.25)",
+                                line=dict(width=2, color="rgba(0,135,68,0.9)")),
                     name="U23", hoverinfo="skip", showlegend=True
                 ))
+
             if u21:
                 cohort_ix = BASELINE_DF.index[ages < 21]
                 cohort = df_disp.loc[df_disp.index.intersection(cohort_ix)]
                 fig.add_trace(go.Scatter(
                     x=cohort[xstat], y=cohort[ystat], mode="markers",
-                    marker=dict(size=16, color="rgba(88,24,173,0.25)", line=dict(width=2, color="rgba(88,24,173,0.95)")),
+                    marker=dict(size=16, color="rgba(88,24,173,0.25)",
+                                line=dict(width=2, color="rgba(88,24,173,0.95)")),
                     name="U21", hoverinfo="skip", showlegend=True
                 ))
 
@@ -1439,6 +1515,8 @@ elif mode == "Stat Scatter":
         )
         _plotly_axes_black(fig)
         st.plotly_chart(fig, use_container_width=True, theme=None)
+
+
 
 # ---------- Role Scatter (safe role scoring) ----------
 elif mode == "Role Scatter":
@@ -1771,11 +1849,81 @@ elif mode == "Top 10 — Stats":
         _plotly_axes_black(fig)
         st.plotly_chart(fig, use_container_width=True, theme=None)
 
-# ---------- Player Finder (rich filters + pills; no Text filter) ----------
-# ---------- Player Finder (values, percentiles, categories, positions) ----------
-# ---------- Player Finder (values, percentiles, categories, positions) ----------
-# ---------- Player Finder (rich filters + pills; no Text filter) ----------
-# ---------- Player Finder (filters; cards show pills from your chosen filter stats) ----------
+# ---------- Best Roles (bar chart of this player's scores across all roles) ----------
+elif mode == "Best Roles":
+    st.subheader("Best Roles for selected player")
+
+    book = role_book_all()
+    if not book:
+        st.info("No roles available.")
+    else:
+        roles = list(book.keys())
+
+        # Compute the player's score for each role — LOCKED to WHOLE DATASET
+        rows = []
+        for role in roles:
+            try:
+                s = role_scores_for_role(role, base_df_override=df_work)  # <- forced baseline
+                val = float(s.get(player_row.name, np.nan))
+            except Exception:
+                val = np.nan
+            rows.append((role, val))
+
+        df_roles = pd.DataFrame(rows, columns=["Role", "Score"]).dropna()
+        if df_roles.empty:
+            st.info("No role scores could be computed for this player with the current dataset.")
+        else:
+            df_roles = df_roles.sort_values("Score", ascending=False)
+            topn = st.slider("Show top N roles", min_value=5, max_value=min(30, len(df_roles)), value=min(10, len(df_roles)))
+            show = df_roles.head(topn)
+
+            fig = go.Figure(go.Bar(
+                x=show["Score"], y=show["Role"], orientation="h",
+                marker=dict(color=show["Score"], cmin=0, cmax=100, colorscale="RdYlGn", line=dict(color="black", width=1)),
+                hovertemplate="<b>%{y}</b><br>Role Score: %{x:.1f}<extra></extra>",
+            ))
+
+            # Title bits
+            mins_col = find_col(df_work, ["Minutes","Mins","Min","Time Played"])
+            apps_col = find_col(df_work, ["Appearances","Apps"])
+            def _fmt_intish(v):
+                try:
+                    f = float(pd.to_numeric(v, errors="coerce")); return f"{int(round(f)):,}"
+                except Exception:
+                    return ""
+            header_bits = [
+                str(player_row.get(pos_col, "")) if pos_col in df_work.columns else "",
+                str(player_row.get("Club", "")) if "Club" in df_work.columns else "",
+                f"Minutes {_fmt_intish(player_row.get(mins_col,''))}" if mins_col else "",
+                f"Apps {_fmt_intish(player_row.get(apps_col,''))}" if apps_col else "",
+            ]
+            head = f"{player_row.get(name_col,'')}"
+            hb = [x for x in header_bits if x]
+            if hb: head += " — " + " • ".join(hb)
+
+            # Baseline note (just so it's clear what scores are computed against)
+            mode_lbl = st.session_state.get("pct_baseline_mode", "Role baseline")
+            if mode_lbl == "Role baseline":
+                toks = role_baseline_tokens(st.session_state.get("active_role"))
+                base_note = ", ".join(toks) if toks else "Role default"
+            elif mode_lbl == "Sidebar positions":
+                base_note = ", ".join(baseline_tokens)
+            else:
+                base_note = "Whole dataset"
+
+            fig.update_layout(
+                title=f"{head}<br><sup>Role Scores (baseline: Whole dataset — locked)</sup>",  # <- explicit
+                xaxis=dict(title="Role Score (0–100)", range=[0, 100]),
+                yaxis=dict(autorange="reversed"),
+                template="simple_white",
+                paper_bgcolor=POSTER_BG, plot_bgcolor=POSTER_BG,
+                font=dict(family=FONT_FAMILY),
+                hoverlabel=dict(bgcolor="white", font_color="black"),
+            )
+            _plotly_axes_black(fig)
+            st.plotly_chart(fig, use_container_width=True, theme=None)
+
+
 elif mode == "Player Finder":
     if "saved_filters" not in st.session_state:
         st.session_state["saved_filters"] = {}
