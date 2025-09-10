@@ -940,6 +940,8 @@ def mpl_pizza(player_row: pd.Series, stat_cols: List[str], title: str,
     age  = player_row.get("Age", np.nan)
     mins = player_row.get("Minutes", np.nan)
     apps = player_row.get("Appearances", np.nan)
+    # NEW: competition (League -> Division fallback)
+    league = player_row.get("League", "") or player_row.get("Division", "")
 
     def _fmt_intish(x):
         try:
@@ -955,15 +957,30 @@ def mpl_pizza(player_row: pd.Series, stat_cols: List[str], title: str,
 
     fig.text(0.5, 0.988, str(name), ha='center', va='top', fontsize=22,
              color=param_color, fontproperties=font_bold)
-    sub1 = " • ".join([x for x in [str(pos) if pos else "", f"Age {age_str}" if age_str else "", str(club) if club else ""] if x])
+
+    # NEW: include competition alongside Club (bullet-separated like the rest)
+    sub1_bits = [
+        str(pos) if pos else "",
+        f"Age {age_str}" if age_str else "",
+        str(club) if club else "",
+        str(league) if league else ""
+    ]
+    sub1 = " • ".join([b for b in sub1_bits if b])
     if sub1:
         fig.text(0.5, 0.954, sub1, ha='center', va='top', fontsize=14,
                  color=param_color, fontproperties=font_normal)
-    sub2 = " • ".join([x for x in [f"Minutes {mins_str}" if mins_str else "", f"Apps {apps_str}" if apps_str else ""] if x])
+
+    sub2_bits = [
+        f"Minutes {mins_str}" if mins_str else "",
+        f"Apps {apps_str}" if apps_str else "",
+    ]
+    sub2 = " • ".join([b for b in sub2_bits if b])
     if sub2:
         fig.text(0.5, 0.93, sub2, ha='center', va='top', fontsize=12,
                  color=param_color, fontproperties=font_normal)
+
     if title:
+        # Keep your existing subtitle (baseline note etc.)
         fig.text(0.5, 0.91, f"{title}", ha='center', va='top', fontsize=12,
                  color=param_color, fontproperties=font_normal)
     return fig
@@ -1161,6 +1178,22 @@ baseline_tokens = st.sidebar.multiselect(
     help="Used when 'Sidebar positions' baseline is selected."
 )
 BASELINE_DF = filter_by_tokens(df_work, baseline_tokens)
+
+age_colname = find_col(df_work, ["Age"])
+if age_colname:
+    ages_all = pd.to_numeric(df_work[age_colname], errors="coerce")
+    age_min = int(np.nanmin(ages_all)) if ages_all.notna().any() else 16
+    age_max = int(np.nanmax(ages_all)) if ages_all.notna().any() else 45
+    max_age_view = st.sidebar.slider("Max Age (view only)", age_min, age_max, value=age_max, step=1)
+else:
+    max_age_view = None
+
+# Build VIEW_DF for charts/tables only; calculations stay on BASELINE_DF/df_work
+if max_age_view is not None and age_colname and age_colname in BASELINE_DF.columns:
+    ages_base = pd.to_numeric(BASELINE_DF[age_colname], errors="coerce")
+    VIEW_DF = BASELINE_DF.loc[ages_base <= max_age_view].copy()
+else:
+    VIEW_DF = BASELINE_DF.copy()
 
 # =========================
 # ========= MODES =========
@@ -1403,8 +1436,7 @@ elif mode == "Distribution":
         _plotly_axes_black(fig)
         st.plotly_chart(fig, use_container_width=True, theme=None)
 
-# ---------- Stat Scatter (always show points; highlight search) ----------
-# ---------- Stat Scatter (always show points; highlight search) ----------
+# ---------- Stat Scatter (always show points; highlight search, include competition) ----------
 elif mode == "Stat Scatter":
     st.subheader("Stat Scatter")
 
@@ -1424,44 +1456,39 @@ elif mode == "Stat Scatter":
         with coly:
             ystat = st.selectbox("Y stat", sorted(set(numeric_cols)), index=min(1, len(numeric_cols)-1))
 
-        age_ok = "Age" in BASELINE_DF.columns
+        age_ok = "Age" in VIEW_DF.columns
         u23 = st.checkbox("Highlight U23", value=False, disabled=not age_ok, key="stat_u23")
         u21 = st.checkbox("Highlight U21", value=False, disabled=not age_ok, key="stat_u21")
         hi_name = st.text_input("Highlight player (type to search)", "", key="stat_hi_q")
 
-        # build display frame from the current cohort
-        df_disp = BASELINE_DF[[name_col]].copy()
-
-        # ensure consistent Club/Pos columns exist for hover (create blanks if missing)
-        if "Club" in BASELINE_DF.columns:
-            df_disp["Club"] = BASELINE_DF["Club"].astype(str)
+        # build display frame from the (view-filtered) cohort
+        df_disp = VIEW_DF[[name_col]].copy()
+        df_disp["Club"] = VIEW_DF["Club"].astype(str) if "Club" in VIEW_DF.columns else ""
+        df_disp["Pos"]  = VIEW_DF[pos_col].astype(str) if pos_col in VIEW_DF.columns else ""
+        if "League" in VIEW_DF.columns:
+            df_disp["League"] = VIEW_DF["League"].astype(str)
+        elif "Division" in VIEW_DF.columns:
+            df_disp["League"] = VIEW_DF["Division"].astype(str)
         else:
-            df_disp["Club"] = ""
+            df_disp["League"] = ""
 
-        if pos_col in BASELINE_DF.columns:
-            df_disp["Pos"] = BASELINE_DF[pos_col].astype(str)
-        else:
-            df_disp["Pos"] = ""
-
-        # numeric x/y and drop rows with missing values for these axes
-        df_disp[xstat] = pd.to_numeric(BASELINE_DF[xstat], errors="coerce")
-        df_disp[ystat] = pd.to_numeric(BASELINE_DF[ystat], errors="coerce")
+        df_disp[xstat] = pd.to_numeric(VIEW_DF[xstat], errors="coerce")
+        df_disp[ystat] = pd.to_numeric(VIEW_DF[ystat], errors="coerce")
         df_disp = df_disp.dropna(subset=[xstat, ystat])
 
-        # scatter with column-name based custom_data (avoids length mismatch)
         fig = px.scatter(
             df_disp,
             x=xstat,
             y=ystat,
-            custom_data=[name_col, "Club", "Pos"],  # <-- column names, not arrays
+            custom_data=[name_col, "Club", "Pos", "League"],
             opacity=0.95
         )
 
-        # unified hover (always Name, Club, Pos + stats)
         hover_tmpl = (
             "<b>%{customdata[0]}</b>"
             "<br>Club: %{customdata[1]}"
             "<br>Pos: %{customdata[2]}"
+            "<br>Comp: %{customdata[3]}"
             f"<br>{xstat}: %{{x:.2f}}"
             f"<br>{ystat}: %{{y:.2f}}"
             "<extra></extra>"
@@ -1470,12 +1497,11 @@ elif mode == "Stat Scatter":
             tr.marker.update(size=8, line=dict(width=1, color="black"))
             tr.update(hovertemplate=hover_tmpl)
 
-        # overlays for age cohorts (visual only)
+        # overlays for age cohorts (visual only, respect view filter)
         if age_ok:
-            ages = pd.to_numeric(BASELINE_DF["Age"], errors="coerce")
-
+            ages = pd.to_numeric(VIEW_DF["Age"], errors="coerce")
             if u23:
-                cohort_ix = BASELINE_DF.index[ages < 23]
+                cohort_ix = VIEW_DF.index[ages < 23]
                 cohort = df_disp.loc[df_disp.index.intersection(cohort_ix)]
                 fig.add_trace(go.Scatter(
                     x=cohort[xstat], y=cohort[ystat], mode="markers",
@@ -1483,9 +1509,8 @@ elif mode == "Stat Scatter":
                                 line=dict(width=2, color="rgba(0,135,68,0.9)")),
                     name="U23", hoverinfo="skip", showlegend=True
                 ))
-
             if u21:
-                cohort_ix = BASELINE_DF.index[ages < 21]
+                cohort_ix = VIEW_DF.index[ages < 21]
                 cohort = df_disp.loc[df_disp.index.intersection(cohort_ix)]
                 fig.add_trace(go.Scatter(
                     x=cohort[xstat], y=cohort[ystat], mode="markers",
@@ -1494,20 +1519,25 @@ elif mode == "Stat Scatter":
                     name="U21", hoverinfo="skip", showlegend=True
                 ))
 
-        # explicit player highlight by search
+        # explicit player highlight by search (label includes competition)
+        title_suffix = ""
         if hi_name:
             prow = df_disp[df_disp[name_col].str.contains(hi_name, case=False, na=False)]
             if not prow.empty:
                 prow = prow.iloc[[0]]
+                label_name = str(prow[name_col].iloc[0])
+                label_league = str(prow["League"].iloc[0]) if "League" in prow.columns else ""
+                label_txt = f"{label_name} — {label_league}" if label_league else label_name
                 fig.add_trace(go.Scatter(
                     x=prow[xstat], y=prow[ystat], mode="markers+text",
                     marker=dict(size=18, color="#D70232", line=dict(width=1, color="black")),
-                    text=prow[name_col], textposition="middle right",
+                    text=[label_txt], textposition="middle right",
                     hoverinfo="skip", showlegend=False, name="Highlight"
                 ))
+                title_suffix = f"<br><sup>Highlight: {label_txt}</sup>"
 
         fig.update_layout(
-            title=f"{ystat} vs {xstat}",
+            title=f"{ystat} vs {xstat}{title_suffix}",
             template="simple_white",
             paper_bgcolor=POSTER_BG, plot_bgcolor=POSTER_BG,
             font=dict(family=FONT_FAMILY),
@@ -1518,17 +1548,17 @@ elif mode == "Stat Scatter":
 
 
 
-# ---------- Role Scatter (safe role scoring) ----------
+
+# ---------- Role Scatter (pos-aware; weighted composite of percentiles, 0–100) ----------
 elif mode == "Role Scatter":
     st.subheader("Role Scatter (pos-aware; weighted composite of percentiles, 0–100)")
 
-    # Safe local scorer in case older helper returns None
     def _safe_role_scores(role_name: str) -> pd.Series:
         weights = role_weights_for(role_name) or {}
         usable = {s: w for s, w in weights.items() if s in df_work.columns and pd.api.types.is_numeric_dtype(df_work[s])}
         if not usable:
             return pd.Series(np.nan, index=df_work.index)
-        base_df = pick_baseline_df_for(role_name)
+        base_df = pick_baseline_df_for(role_name)  # <-- calculations unchanged
         W = sum(abs(float(w)) for w in usable.values()) or 1.0
         out = None
         for s, w in usable.items():
@@ -1547,7 +1577,7 @@ elif mode == "Role Scatter":
         with colx: ax = st.selectbox("X role", names, index=default_x, key="role_x")
         with coly: ay = st.selectbox("Y role", names, index=min(1, len(names)-1), key="role_y")
 
-        age_ok = "Age" in BASELINE_DF.columns
+        age_ok = "Age" in VIEW_DF.columns
         u23 = st.checkbox("Highlight U23", value=False, disabled=not age_ok, key="role_u23")
         u21 = st.checkbox("Highlight U21", value=False, disabled=not age_ok, key="role_u21")
         hi_name = st.text_input("Highlight player (type to search)", "", key="role_hi_q")
@@ -1555,47 +1585,78 @@ elif mode == "Role Scatter":
         score_x_all = _safe_role_scores(ax)
         score_y_all = _safe_role_scores(ay)
 
-        df_disp = BASELINE_DF[[name_col]].copy()
-        if "Club" in BASELINE_DF.columns: df_disp["Club"] = BASELINE_DF["Club"]
-        if pos_col in BASELINE_DF.columns: df_disp["Pos"] = BASELINE_DF[pos_col]
+        # Display df from view-filtered cohort; scores computed globally
+        df_disp = VIEW_DF[[name_col]].copy()
+        df_disp["Club"] = VIEW_DF["Club"].astype(str) if "Club" in VIEW_DF.columns else ""
+        df_disp["Pos"]  = VIEW_DF[pos_col].astype(str) if pos_col in VIEW_DF.columns else ""
+        if "League" in VIEW_DF.columns:
+            df_disp["League"] = VIEW_DF["League"].astype(str)
+        elif "Division" in VIEW_DF.columns:
+            df_disp["League"] = VIEW_DF["Division"].astype(str)
+        else:
+            df_disp["League"] = ""
+
         df_disp[ax] = score_x_all.reindex(df_disp.index)
         df_disp[ay] = score_y_all.reindex(df_disp.index)
         df_disp = df_disp[df_disp[ax].notna() & df_disp[ay].notna()]
 
-        fig = px.scatter(df_disp, x=ax, y=ay, hover_name=name_col,
-                         hover_data={name_col:False, "Club":True, "Pos":True, ax:":.1f", ay:":.1f"},
-                         opacity=0.95)
+        fig = px.scatter(
+            df_disp,
+            x=ax, y=ay,
+            custom_data=[name_col, "Club", "Pos", "League"],
+            opacity=0.95
+        )
+
+        hover_tmpl = (
+            "<b>%{customdata[0]}</b>"
+            "<br>Club: %{customdata[1]}"
+            "<br>Pos: %{customdata[2]}"
+            "<br>Comp: %{customdata[3]}"
+            f"<br>{ax}: %{{x:.1f}}"
+            f"<br>{ay}: %{{y:.1f}}"
+            "<extra></extra>"
+        )
         for tr in fig.data:
             tr.marker.update(size=8, line=dict(width=1, color="black"))
+            tr.update(hovertemplate=hover_tmpl)
 
         if age_ok:
-            ages = pd.to_numeric(BASELINE_DF["Age"], errors="coerce")
+            ages = pd.to_numeric(VIEW_DF["Age"], errors="coerce")
             if u23:
-                cohort_ix = BASELINE_DF.index[ages < 23]
+                cohort_ix = VIEW_DF.index[ages < 23]
                 cohort = df_disp.loc[df_disp.index.intersection(cohort_ix)]
-                fig.add_trace(go.Scatter(x=cohort[ax], y=cohort[ay], mode="markers",
-                                         marker=dict(size=14, color="rgba(0,135,68,0.25)", line=dict(width=2, color="rgba(0,135,68,0.9)")),
-                                         name="U23", hoverinfo="skip", showlegend=True))
+                fig.add_trace(go.Scatter(
+                    x=cohort[ax], y=cohort[ay], mode="markers",
+                    marker=dict(size=14, color="rgba(0,135,68,0.25)", line=dict(width=2, color="rgba(0,135,68,0.9)")),
+                    name="U23", hoverinfo="skip", showlegend=True
+                ))
             if u21:
-                cohort_ix = BASELINE_DF.index[ages < 21]
+                cohort_ix = VIEW_DF.index[ages < 21]
                 cohort = df_disp.loc[df_disp.index.intersection(cohort_ix)]
-                fig.add_trace(go.Scatter(x=cohort[ax], y=cohort[ay], mode="markers",
-                                         marker=dict(size=16, color="rgba(88,24,173,0.25)", line=dict(width=2, color="rgba(88,24,173,0.95)")),
-                                         name="U21", hoverinfo="skip", showlegend=True))
+                fig.add_trace(go.Scatter(
+                    x=cohort[ax], y=cohort[ay], mode="markers",
+                    marker=dict(size=16, color="rgba(88,24,173,0.25)", line=dict(width=2, color="rgba(88,24,173,0.95)")),
+                    name="U21", hoverinfo="skip", showlegend=True
+                ))
 
+        title_suffix = ""
         if hi_name:
             prow = df_disp[df_disp[name_col].str.contains(hi_name, case=False, na=False)]
             if not prow.empty:
                 prow = prow.iloc[[0]]
+                label_name = str(prow[name_col].iloc[0])
+                label_league = str(prow["League"].iloc[0]) if "League" in prow.columns else ""
+                label_txt = f"{label_name} — {label_league}" if label_league else label_name
                 fig.add_trace(go.Scatter(
                     x=prow[ax], y=prow[ay], mode="markers+text",
                     marker=dict(size=18, color="#D70232", line=dict(width=1, color="black")),
-                    text=prow[name_col], textposition="middle right",
+                    text=[label_txt], textposition="middle right",
                     hoverinfo="skip", showlegend=False, name="Highlight"
                 ))
+                title_suffix = f"<br><sup>Highlight: {label_txt}</sup>"
 
         fig.update_layout(
-            title=f"Role Scores — {ay} vs {ax}",
+            title=f"Role Scores — {ay} vs {ax}{title_suffix}",
             xaxis=dict(title=ax, range=[0,100]),
             yaxis=dict(title=ay, range=[0,100]),
             template="simple_white",
@@ -1606,15 +1667,19 @@ elif mode == "Role Scatter":
         _plotly_axes_black(fig)
         st.plotly_chart(fig, use_container_width=True, theme=None)
 
+
+
 # ---------- Top 10 — Roles (dynamic color) ----------
+# ---------- Top 10 — Roles (dynamic color, view-only max age via VIEW_DF) ----------
 elif mode == "Top 10 — Roles":
     st.subheader("Top 10 by Role Score (0–100)")
+
     def _safe_role_scores(role_name: str) -> pd.Series:
         weights = role_weights_for(role_name) or {}
         usable = {s: w for s, w in weights.items() if s in df_work.columns and pd.api.types.is_numeric_dtype(df_work[s])}
         if not usable:
             return pd.Series(np.nan, index=df_work.index)
-        base_df = pick_baseline_df_for(role_name)
+        base_df = pick_baseline_df_for(role_name)  # calculations unchanged
         W = sum(abs(float(w)) for w in usable.values()) or 1.0
         out = None
         for s, w in usable.items():
@@ -1630,15 +1695,24 @@ elif mode == "Top 10 — Roles":
         roles = list(book.keys())
         ridx = roles.index(st.session_state.get("active_role")) if st.session_state.get("active_role") in roles else 0
         role = st.selectbox("Role", roles, index=ridx)
-        scores_all = _safe_role_scores(role).round(1)
-        scores = scores_all.reindex(BASELINE_DF.index)
 
-        tbl = BASELINE_DF[[name_col]].copy()
-        if "Club" in BASELINE_DF.columns: tbl["Club"] = BASELINE_DF["Club"]
-        if pos_col in BASELINE_DF.columns: tbl["Pos"] = BASELINE_DF[pos_col]
+        # compute globally, then display only rows in VIEW_DF (respects Max Age)
+        scores_all = _safe_role_scores(role).round(1)
+        if VIEW_DF.empty:
+            st.info("No players in the current view (check Max Age / positions / minutes).")
+            st.stop()
+
+        scores = scores_all.reindex(VIEW_DF.index)
+
+        tbl = VIEW_DF[[name_col]].copy()
+        if "Club" in VIEW_DF.columns: tbl["Club"] = VIEW_DF["Club"]
+        if pos_col in VIEW_DF.columns: tbl["Pos"] = VIEW_DF[pos_col]
         tbl["Score"] = scores
 
         top = tbl.dropna(subset=["Score"]).sort_values("Score", ascending=False).head(10)
+        if top.empty:
+            st.info("No role scores available in the current view.")
+            st.stop()
 
         fig = go.Figure(go.Bar(
             x=top["Score"], y=top[name_col], orientation="h",
@@ -1658,11 +1732,14 @@ elif mode == "Top 10 — Roles":
         _plotly_axes_black(fig)
         st.plotly_chart(fig, use_container_width=True, theme=None)
 
+
 # ---------- Build: Metrics & Archetypes (custom metrics + custom/override roles) ----------
+# ---------- Build: Metrics & Archetypes (powerful custom role editor + positions) ----------
+# ---------- Build: Metrics & Archetypes (classic UI, full edit of custom roles) ----------
 elif mode == "Build: Metrics & Archetypes":
     st.subheader("Create a custom metric")
 
-    # Column choices
+    # ----- Metric builder (unchanged behaviour) -----
     numeric_like = [c for c in df_work.columns if pd.api.types.is_numeric_dtype(df_work[c])]
     for c in df_work.columns:
         if c not in numeric_like and df_work[c].dtype == object:
@@ -1709,49 +1786,123 @@ elif mode == "Build: Metrics & Archetypes":
                 st.info("Enter an existing column name to remove.")
 
     st.markdown("---")
-    st.subheader("Create / Edit Custom Role (unified: stat → weight)")
+    st.subheader("Create / Edit Custom Role (classic layout)")
 
-    # Custom role builder
-    role_name_new = st.text_input("Role name (new or existing)")
-    pick_stats = st.multiselect("Stats for this role", options=numeric_like, help="Choose stats; assign a weight to each.")
+    # ---------- Custom role editor (classic UI) ----------
+    st.session_state.setdefault("role_book_custom", {})
+    custom_roles = st.session_state["role_book_custom"]
 
+    # Select existing or create new
+    choices = ["➕ Create new…"] + sorted(custom_roles.keys())
+    sel = st.selectbox("Select a custom role", choices, key="cr_select")
+    is_new = (sel == "➕ Create new…")
+
+    # Load existing (or empty)
+    loaded = {"baseline": None, "weights": {}} if is_new else dict(custom_roles.get(sel, {"baseline": None, "weights": {}}))
+    loaded_weights = dict(loaded.get("weights", {}))
+    loaded_baseline = loaded.get("baseline", [])
+    if not isinstance(loaded_baseline, list):
+        loaded_baseline = []
+
+    # Name + positions (baseline tokens)
+    role_name_input = st.text_input("Role name", value=("" if is_new else sel), key="cr_name")
+    baseline_tokens = st.multiselect(
+        "Positions for this role (optional baseline when 'Role baseline' is selected)",
+        options=options_tokens or ALLOWED_TOKENS,
+        default=[t for t in loaded_baseline if t in (options_tokens or ALLOWED_TOKENS)],
+        help="Leave empty to fall back to 'Sidebar positions' / 'Whole dataset'."
+    )
+
+    # Stats picker (preselect existing stats), then weights per stat
+    preset_stats = sorted(set(loaded_weights.keys()))
+    pick_stats = st.multiselect(
+        "Stats for this role",
+        options=numeric_like,
+        default=preset_stats,
+        help="Choose stats; set a weight for each below."
+    )
+
+    # Render weight inputs in tidy columns (classic look)
     weights_map = {}
     if pick_stats:
-        cols_w = st.columns(min(4, len(pick_stats)))
+        cols = st.columns(min(4, len(pick_stats)))
         for i, s in enumerate(pick_stats):
-            with cols_w[i % len(cols_w)]:
-                weights_map[s] = st.number_input(f"{s}", min_value=0.0, value=1.0, step=0.1, key=f"rbw_{s}")
+            with cols[i % len(cols)]:
+                default_w = float(loaded_weights.get(s, 1.0))
+                weights_map[s] = st.number_input(
+                    f"{s}",
+                    min_value=0.0, value=default_w, step=0.1,
+                    key=f"cr_w_{sel}_{s}"
+                )
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        if st.button("Save Custom Role", key="btn_save_custom_role"):
-            if role_name_new and weights_map:
-                st.session_state["role_book_custom"][role_name_new] = {
-                    "baseline": None,  # uses sidebar cohort unless you override below
-                    "weights": {k: float(v) for k, v in weights_map.items()},
-                }
-                st.success(f"Saved custom role '{role_name_new}'.")
-            else:
-                st.warning("Provide a role name and at least one stat.")
-    with c2:
-        if st.button("Delete Custom Role", key="btn_del_custom_role"):
-            if role_name_new and role_name_new in st.session_state["role_book_custom"]:
-                st.session_state["role_book_custom"].pop(role_name_new, None)
-                st.success(f"Deleted custom role '{role_name_new}'.")
-            else:
-                st.info("Enter an existing custom role name to delete.")
-    with c3:
-        st.caption("Tip: This saves in session. Export/import below to persist.")
+    # Actions: Save / Delete / Duplicate
+    b1, b2, b3, b4 = st.columns([1.1,1.1,1.1,3])
+    with b1:
+        save_clicked = st.button("Save role", type="primary", key="cr_save")
+    with b2:
+        del_clicked = st.button("Delete role", disabled=is_new, key="cr_del")
+    with b3:
+        dup_clicked = st.button("Duplicate", disabled=is_new, key="cr_dup")
+    with b4:
+        dup_name = st.text_input("Duplicate as", value=(f"{sel} copy" if not is_new else ""), key="cr_dup_name")
 
-    # Override a built-in role (edit weights; keep built-in baseline)
+    # Save
+    if save_clicked:
+        if not role_name_input:
+            st.warning("Please enter a role name.")
+        elif not weights_map:
+            st.warning("Pick at least one stat and set weights.")
+        else:
+            cfg = {
+                "baseline": baseline_tokens if baseline_tokens else None,
+                "weights": {str(k): float(v) for k, v in weights_map.items()},
+            }
+            # rename if needed
+            if not is_new and role_name_input != sel:
+                if role_name_input in custom_roles and role_name_input != sel:
+                    st.error(f"A custom role named '{role_name_input}' already exists.")
+                else:
+                    custom_roles.pop(sel, None)
+                    custom_roles[role_name_input] = cfg
+                    st.success(f"Renamed and saved role as '{role_name_input}'.")
+            else:
+                custom_roles[role_name_input] = cfg
+                st.success(f"Saved role '{role_name_input}'.")
+            st.session_state["role_book_custom"] = custom_roles
+
+    # Delete
+    if del_clicked and not is_new:
+        custom_roles.pop(sel, None)
+        st.session_state["role_book_custom"] = custom_roles
+        st.success(f"Deleted custom role '{sel}'.")
+
+    # Duplicate
+    if dup_clicked and not is_new:
+        if not dup_name:
+            st.warning("Enter a name to duplicate to.")
+        elif dup_name in custom_roles:
+            st.error(f"A custom role named '{dup_name}' already exists.")
+        else:
+            custom_roles[dup_name] = {
+                "baseline": baseline_tokens if baseline_tokens else None,
+                "weights": {str(k): float(v) for k, v in (weights_map or loaded_weights).items()},
+            }
+            st.session_state["role_book_custom"] = custom_roles
+            st.success(f"Duplicated '{sel}' as '{dup_name}'.")
+
+    st.caption("Tip: This saves in-session. Export/import below to persist.")
+
+    # ---------- Override a built-in role (same classic look; optional baseline positions) ----------
     st.markdown("---")
-    st.subheader("Override a Built-in Role (edit weights)")
+    st.subheader("Override a Built-in Role (edit weights and optional positions)")
 
-    built_names = [k for k in ROLE_BOOK_BUILTIN.keys()]
+    built_names = list(ROLE_BOOK_BUILTIN.keys())
     if built_names:
         target = st.selectbox("Built-in role to override", built_names, key="override_pick")
         base_cfg = ROLE_BOOK_BUILTIN.get(target, {})
         base_weights = dict(base_cfg.get("weights", {}))
+        base_baseline_tokens = base_cfg.get("baseline", []) if isinstance(base_cfg.get("baseline", []), list) else []
+
         if not base_weights:
             st.info("This role has no weight map; nothing to override.")
         else:
@@ -1759,17 +1910,34 @@ elif mode == "Build: Metrics & Archetypes":
             new_w = {}
             for i, (stat, w) in enumerate(sorted(base_weights.items())):
                 with cols[i % len(cols)]:
-                    new_w[stat] = st.number_input(stat, min_value=0.0, value=float(w), step=0.1, key=f"ov_{target}_{stat}")
+                    new_w[stat] = st.number_input(
+                        stat, min_value=0.0, value=float(w), step=0.1, key=f"ov_{target}_{stat}"
+                    )
+
+            ov_baseline_toggle = st.checkbox(
+                "Override baseline positions for this role",
+                value=False, key=f"ov_baseline_toggle_{target}"
+            )
+            if ov_baseline_toggle:
+                ov_tokens = st.multiselect(
+                    "Positions to use for this role (optional override)",
+                    options=options_tokens or ALLOWED_TOKENS,
+                    default=[t for t in base_baseline_tokens if t in (options_tokens or ALLOWED_TOKENS)],
+                    key=f"ov_baseline_tokens_{target}"
+                )
+            else:
+                ov_tokens = base_baseline_tokens
+
             if st.button("Save override", key="btn_save_override"):
                 st.session_state["role_book_custom"][target] = {
-                    "baseline": base_cfg.get("baseline", None),
+                    "baseline": ov_baseline_toggle and ov_tokens and list(ov_tokens) or base_cfg.get("baseline", None),
                     "weights": {k: float(v) for k, v in new_w.items()},
                 }
                 st.success(f"Saved override for '{target}'.")
     else:
         st.caption("No built-in roles found.")
 
-    # Export / Import all custom roles
+    # ---------- Export / Import ----------
     st.markdown("---")
     st.subheader("Export / Import Custom Roles")
 
@@ -1787,14 +1955,13 @@ elif mode == "Build: Metrics & Archetypes":
         try:
             data = json.loads(up.read().decode("utf-8"))
             if isinstance(data, dict) and "roles" in data and isinstance(data["roles"], dict):
-                # coerce shapes
                 cleaned = {}
                 for rname, cfg in data["roles"].items():
                     if not isinstance(cfg, dict): continue
                     w = cfg.get("weights", {})
                     if isinstance(w, dict) and w:
                         cleaned[rname] = {
-                            "baseline": cfg.get("baseline", None),
+                            "baseline": cfg.get("baseline", None) if isinstance(cfg.get("baseline", None), list) and cfg.get("baseline", None) else None,
                             "weights": {str(s): float(wv) for s, wv in w.items()},
                         }
                 st.session_state["role_book_custom"].update(cleaned)
@@ -1805,29 +1972,45 @@ elif mode == "Build: Metrics & Archetypes":
             st.error(f"Import failed: {e}")
 
 
+
+
 # ---------- Top 10 — Stats (percentile leaders; dynamic color; hover shows value 2dp) ----------
+# ---------- Top 10 — Stats (by percentile; view-only max age via VIEW_DF) ----------
 elif mode == "Top 10 — Stats":
     st.subheader("Top 10 — Stats (by percentile)")
+
+    # collect numeric columns
     numeric_cols = [c for c in df_work.columns if pd.api.types.is_numeric_dtype(df_work[c])]
     for c in df_work.columns:
         if c not in numeric_cols and df_work[c].dtype == object:
             if pd.to_numeric(df_work[c], errors="coerce").notna().mean() > 0.55:
                 numeric_cols.append(c)
+
     if not numeric_cols:
         st.info("No numeric columns available.")
     else:
         stat = st.selectbox("Stat", sorted(set(numeric_cols)))
+
+        # calculations unchanged (percentiles vs chosen baseline)
         base_df = pick_baseline_df_for(None)
         pct_all = column_percentiles(df_work[stat], base_df[stat], is_less_better(stat)).round(1)
-        pct = pct_all.reindex(BASELINE_DF.index)
 
-        tbl = BASELINE_DF[[name_col]].copy()
-        if "Club" in BASELINE_DF.columns: tbl["Club"] = BASELINE_DF["Club"]
-        if pos_col in BASELINE_DF.columns: tbl["Pos"] = BASELINE_DF[pos_col]
-        tbl["Value"] = pd.to_numeric(BASELINE_DF[stat], errors="coerce")
+        if VIEW_DF.empty:
+            st.info("No players in the current view (check Max Age / positions / minutes).")
+            st.stop()
+
+        pct = pct_all.reindex(VIEW_DF.index)
+
+        tbl = VIEW_DF[[name_col]].copy()
+        if "Club" in VIEW_DF.columns: tbl["Club"] = VIEW_DF["Club"]
+        if pos_col in VIEW_DF.columns: tbl["Pos"] = VIEW_DF[pos_col]
+        tbl["Value"] = pd.to_numeric(VIEW_DF[stat], errors="coerce")
         tbl["Percentile"] = pct
 
         top = tbl.dropna(subset=["Percentile"]).sort_values("Percentile", ascending=False).head(10)
+        if top.empty:
+            st.info("No percentile data available in the current view.")
+            st.stop()
 
         customdata = np.stack([top.get("Club", pd.Series([""]*len(top))), top["Value"]], axis=1)
 
@@ -1848,6 +2031,7 @@ elif mode == "Top 10 — Stats":
         )
         _plotly_axes_black(fig)
         st.plotly_chart(fig, use_container_width=True, theme=None)
+
 
 # ---------- Best Roles (bar chart of this player's scores across all roles) ----------
 elif mode == "Best Roles":
