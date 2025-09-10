@@ -964,7 +964,7 @@ uploaded = st.sidebar.file_uploader(
 
 st.sidebar.header("Downloads (FM helper files)")
 for fname, label in [
-    ("Player Search.fmf", "Download Player Search.fmf"),
+    ("player search.fmf", "Download Player Search.fmf"),
     ("leagues filter.fmf", "Download leagues filter.fmf"),
 ]:
     fpath = os.path.join(APP_DIR, fname)
