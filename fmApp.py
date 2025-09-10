@@ -954,12 +954,36 @@ def mpl_pizza(player_row: pd.Series, stat_cols: List[str], title: str,
 st.title("FM Analytics")
 
 # ---- Upload in sidebar ----
+# ---- Sidebar: Upload + helper downloads (no expanders, no duplicates) ----
 st.sidebar.header("Upload")
-uploaded = st.sidebar.file_uploader("Upload FM HTML export (or CSV)", type=["html","htm","csv"])
+uploaded = st.sidebar.file_uploader(
+    "Upload FM HTML export (or CSV)",
+    type=["html", "htm", "csv"],
+    key="upload_main",  # unique key so we don't collide
+)
+
+st.sidebar.header("Downloads (FM helper files)")
+for fname, label in [
+    ("Player Search.fmf", "Download Player Search.fmf"),
+    ("leagues filter.fmf", "Download leagues filter.fmf"),
+]:
+    fpath = os.path.join(APP_DIR, fname)
+    if os.path.isfile(fpath):
+        with open(fpath, "rb") as fh:
+            st.sidebar.download_button(
+                label,
+                data=fh.read(),
+                file_name=fname,
+                mime="application/octet-stream",
+                key=unique_key(f"dl_{re.sub(r'\\W+','_', fname)}"),
+                help="Save into Documents\\Football Manager 2024\\Views (Player Search.fmf) or \\Filters (leagues filter.fmf).",
+            )
+    else:
+        st.sidebar.caption(f"*{fname} not found in working directory.*")
 
 @st.cache_data(show_spinner=True)
 def parse_and_cache(name: str, raw: bytes) -> Tuple[pd.DataFrame, str]:
-    if name.lower().endswith((".html",".htm")):
+    if name.lower().endswith((".html", ".htm")):
         dfp = read_fm_html(io.BytesIO(raw))
     else:
         dfp = pd.read_csv(io.BytesIO(raw))
@@ -967,7 +991,7 @@ def parse_and_cache(name: str, raw: bytes) -> Tuple[pd.DataFrame, str]:
     dfp = apply_hard_remap(dfp)
 
     # build position tokens
-    pos_col0 = find_col(dfp, ["Pos","Position"])
+    pos_col0 = find_col(dfp, ["Pos", "Position"])
     if pos_col0 is None:
         dfp["__pos_tokens"] = [[] for _ in range(len(dfp))]
     else:
@@ -982,6 +1006,7 @@ def parse_and_cache(name: str, raw: bytes) -> Tuple[pd.DataFrame, str]:
     cache_id = f"{hash((name, dfp.shape, tuple(dfp.columns)))}"
     return dfp, cache_id
 
+# Parse on demand
 df = pd.DataFrame()
 cache_id = ""
 if uploaded is not None:
@@ -990,12 +1015,12 @@ if uploaded is not None:
     except Exception as e:
         st.error(f"Failed to read file: {e}")
 
-# ---- If no data yet, show Import Guide and stop ----
+# ---- If no data yet, show the Import Guide (plain, no expander) and stop ----
 if df.empty:
-    with st.sidebar.expander("Import Guide", expanded=True):
-        st.caption("Read these steps in the main panel while you prepare your export.")
+    st.title("Import Guide")
     render_import_guide()
     st.stop()
+
 
 # Make a copy we can mutate during session (e.g., custom metrics)
 df_work = df.copy()
@@ -1024,6 +1049,7 @@ st.write("")  # tiny spacer
 
 # ==== SIDEBAR FILTERS (minutes, player search, role, baseline, positions) ====
 st.sidebar.header("Filters")
+
 
 # Minimum minutes slider
 _min_col = find_col(df_work, ["Minutes","Mins","Min","Time Played"])
